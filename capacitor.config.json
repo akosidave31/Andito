@@ -1,0 +1,8 @@
+{
+  "appId": "com.dapu.andito",
+  "appName": "Andito",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  }
+}

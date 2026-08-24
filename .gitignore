@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# Capacitor's android/ folder IS committed on purpose — the GitHub Actions
+# build depends on it already being in the repo. Only ignore its own build
+# output, not the project itself.
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
