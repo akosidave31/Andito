@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Andito</string>
+    <string name="title_activity_main">Andito</string>
+    <string name="package_name">com.dapu.andito</string>
+    <string name="custom_url_scheme">com.dapu.andito</string>
+</resources>
