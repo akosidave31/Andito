@@ -7,12 +7,15 @@ import { LayoutDashboard, ShoppingCart, Package, Database, Settings, Search, Sto
  * Firestore collections: stores / listings / sales.
  * ------------------------------------------------------------------ */
 
+/* Only MY_STORE's slot exists — a fresh install has no fictional competitor
+   stores and no fictional products. name/kind/area/hours/phone start blank
+   (the same shape a first-time "I have a store" signup already produces),
+   so a real owner's very first launch is a genuinely empty marketplace, not
+   someone else's demo inventory. lat/lng/fallbackMeters stay populated so
+   distance math doesn't NaN before the owner sets a real location — it's
+   inert until the store actually has a name and shows up anywhere. */
 const STORES = [
-  { id: "s1", name: "ABC Computer Store", kind: "Computer parts & repair", area: "Poblacion, Rizal St.", lat: 14.173371, lng: 121.204259, fallbackMeters: 400, hours: "9AM–7PM · Mon–Sat", phone: "0917 555 0101" },
-  { id: "s2", name: "Delgado Hardware", kind: "Hardware & construction", area: "Corner Mabini St.", lat: 14.168496, lng: 121.211512, fallbackMeters: 900, hours: "7AM–6PM · Daily", phone: "0918 555 0143" },
-  { id: "s3", name: "Santos Motor Parts", kind: "Motorcycle parts", area: "Bypass Road", lat: 14.159009, lng: 121.209786, fallbackMeters: 1400, hours: "8AM–6PM · Mon–Sat", phone: "0920 555 0177" },
-  { id: "s4", name: "Nena's Store", kind: "Corner store", area: "Purok 3", lat: 14.171023, lng: 121.201294, fallbackMeters: 250, hours: "6AM–9PM · Daily", phone: "0995 555 0122" },
-  { id: "s5", name: "MedPlus Pharmacy", kind: "Pharmacy", area: "Town Plaza", lat: 14.163991, lng: 121.201082, fallbackMeters: 700, hours: "8AM–8PM · Daily", phone: "0917 555 0190" },
+  { id: "s1", name: "", kind: "", area: "", lat: 14.173371, lng: 121.204259, fallbackMeters: 400, hours: "", phone: "" },
 ];
 
 /* Seed listings are written as "checked N hours ago" for readability, then
@@ -21,58 +24,23 @@ const STORES = [
    a static "age" number would otherwise look frozen forever once persisted. */
 const hoursAgo = (n) => Date.now() - n * 3600000;
 
-/* qty + cost + unitsWeek only exist for the store you own (s1).
-   lowAt is an optional per-product override for the low-stock threshold —
-   when absent, the store's default (Settings → Low-stock alert) applies. */
-const LISTINGS = [
-  { id: "l1", storeId: "s1", name: "65W USB-C Laptop Charger", brand: "Baseus", specs: ["USB-C PD", "65W", "GaN"], price: 850, cost: 610, qty: 9, unitsWeek: 11, status: "in", lastCheckedAt: hoursAgo(2) },
-  { id: "l2", storeId: "s1", name: "16GB DDR4 RAM", brand: "Kingston", specs: ["DDR4", "3200MHz", "SODIMM"], price: 2500, cost: 1980, qty: 6, unitsWeek: 4, status: "in", lastCheckedAt: hoursAgo(6) },
-  { id: "l3", storeId: "s1", name: "RTX 3060 Graphics Card", brand: "Palit", specs: ["12GB VRAM", "Dual fan"], price: 15000, cost: 12600, qty: 2, unitsWeek: 1, status: "low", lastCheckedAt: hoursAgo(20), lowAt: 1 },
-  { id: "l4", storeId: "s1", name: "HDMI Cable 2m", brand: "Ugreen", specs: ["4K 60Hz"], price: 320, cost: 175, qty: 24, unitsWeek: 17, status: "in", lastCheckedAt: hoursAgo(30), lowAt: 8 },
-  { id: "l5", storeId: "s1", name: "Wireless Mouse M170", brand: "Logitech", specs: ["USB receiver"], price: 690, cost: 480, qty: 0, unitsWeek: 8, status: "out", lastCheckedAt: hoursAgo(9) },
-  { id: "l6", storeId: "s1", name: "Universal Laptop Charger 90W", brand: "Generic", specs: ["8 tips", "19V"], price: 1150, cost: 760, qty: 5, unitsWeek: 2, status: "in", lastCheckedAt: hoursAgo(96) },
-  { id: "l22", storeId: "s1", name: "SSD 512GB NVMe", brand: "Kingspec", specs: ["M.2", "PCIe 3.0"], price: 2200, cost: 1740, qty: 3, unitsWeek: 6, status: "low", lastCheckedAt: hoursAgo(52) },
-  { id: "l23", storeId: "s1", name: "Keyboard + Mouse Combo", brand: "A4Tech", specs: ["Wired", "USB"], price: 780, cost: 520, qty: 12, unitsWeek: 3, status: "in", lastCheckedAt: hoursAgo(4) },
-  { id: "l24", storeId: "s1", name: "Laptop Cooling Pad", brand: "Generic", specs: ["5 fan", "RGB"], price: 650, cost: 400, qty: 0, unitsWeek: 5, status: "out", lastCheckedAt: hoursAgo(140) },
+/* No seed products. Everything in Inventory is something a real owner
+   actually added. */
+const LISTINGS = [];
 
-  { id: "l7", storeId: "s2", name: "LED Bulb 9W", brand: "Firefly", specs: ["Daylight", "E27"], price: 95, status: "in", lastCheckedAt: hoursAgo(4) },
-  { id: "l8", storeId: "s2", name: 'PVC Pipe 1/2"', brand: "Neltex", specs: ["3 meters", "Blue"], price: 180, status: "in", lastCheckedAt: hoursAgo(4) },
-  { id: "l9", storeId: "s2", name: "Portland Cement 40kg", brand: "Holcim", specs: ["Type 1P"], price: 265, status: "low", lastCheckedAt: hoursAgo(12) },
-  { id: "l10", storeId: "s2", name: "Extension Cord 5m", brand: "Omni", specs: ["4 gang", "Heavy duty"], price: 480, status: "in", lastCheckedAt: hoursAgo(50) },
-  { id: "l11", storeId: "s2", name: "Hacksaw Blade", brand: "Stanley", specs: ["12 inch"], price: 75, status: "out", lastCheckedAt: hoursAgo(130) },
+const SALES_THIS_WEEK = [0, 0, 0, 0, 0, 0, 0];
+const SALES_LAST_WEEK = [0, 0, 0, 0, 0, 0, 0];
 
-  { id: "l12", storeId: "s3", name: "Brake Pads (Front)", brand: "Yamaha", specs: ["Mio i125", "Genuine"], price: 420, status: "in", lastCheckedAt: hoursAgo(8) },
-  { id: "l13", storeId: "s3", name: "Chain Lube Spray", brand: "Motul", specs: ["400ml"], price: 590, status: "in", lastCheckedAt: hoursAgo(8) },
-  { id: "l14", storeId: "s3", name: "Motorcycle Battery", brand: "Motolite", specs: ["12V 5Ah"], price: 1850, status: "low", lastCheckedAt: hoursAgo(44) },
-
-  { id: "l15", storeId: "s4", name: "Phone Charger (Micro USB)", brand: "Generic", specs: ["2A", "1m cable"], price: 150, status: "low", lastCheckedAt: hoursAgo(3) },
-  { id: "l16", storeId: "s4", name: "Rice 5kg (Sinandomeng)", brand: "—", specs: ["5kg sack"], price: 320, status: "in", lastCheckedAt: hoursAgo(1) },
-  { id: "l17", storeId: "s4", name: "Cooking Oil 1L", brand: "Baguio", specs: ["1 liter"], price: 145, status: "in", lastCheckedAt: hoursAgo(1) },
-  { id: "l18", storeId: "s4", name: "LPG Refill 11kg", brand: "Petron Gasul", specs: ["11kg refill"], price: 950, status: "out", lastCheckedAt: hoursAgo(5) },
-
-  { id: "l19", storeId: "s5", name: "Paracetamol 500mg", brand: "Biogesic", specs: ["Per tablet"], price: 7, status: "in", lastCheckedAt: hoursAgo(2) },
-  { id: "l20", storeId: "s5", name: "Isopropyl Alcohol 500ml", brand: "Green Cross", specs: ["70% solution"], price: 125, status: "in", lastCheckedAt: hoursAgo(2) },
-  { id: "l21", storeId: "s5", name: "Digital Thermometer", brand: "Omron", specs: ["Underarm"], price: 480, status: "low", lastCheckedAt: hoursAgo(70) },
-];
-
-/* index 0 = 6 days ago … index 6 = today */
-const SALES_THIS_WEEK = [4820, 6150, 3990, 7310, 5480, 8920, 3260];
-const SALES_LAST_WEEK = [4100, 5200, 4650, 6100, 5900, 7400, 6800];
-
-/* what shoppers near this store searched for, and whether it's listed */
+/* Fallback content for the seller Dashboard's "Searched near you" panel —
+   ONLY shown there, clearly labeled "Example" (see isLiveDemand in
+   SellerView), and replaced the moment any real search activity exists.
+   Never shown to shoppers as if it were real data. */
 const DEMAND = [
   { q: "laptop charger", searches: 34, listed: true },
   { q: "printer ink 664", searches: 21, listed: false },
   { q: "cctv camera", searches: 17, listed: false },
   { q: "wireless mouse", searches: 15, listed: true },
   { q: "laptop battery", searches: 12, listed: false },
-];
-
-const RECENT_STORE_SEARCHES = [
-  { storeId: "s1", searches: 28 },
-  { storeId: "s4", searches: 19 },
-  { storeId: "s2", searches: 14 },
-  { storeId: "s5", searches: 9 },
 ];
 
 const SUGGESTED = ["laptop charger", "cement", "brake pads", "rice", "led bulb"];
@@ -167,13 +135,17 @@ function FavHeart({ on, onClick, className = "", size = 16 }) {
 }
 
 function SearchView({
-  stores, listings, query, setQuery, onOpenStore, onRequest,
+  stores: allStores, listings, query, setQuery, onOpenStore, onRequest,
   favorites, onToggleFavoriteProduct, onToggleFavoriteStore,
   locStatus, onRequestLocation,
 }) {
   const [mode, setMode] = useState("products");
   const [favOnly, setFavOnly] = useState(false);
   const tokens = norm(query);
+
+  // A store with no name yet hasn't been set up by its owner — shoppers
+  // should never see it, whether browsing, searching, or via a listing.
+  const stores = useMemo(() => allStores.filter((s) => s.name.trim() !== ""), [allStores]);
 
   const results = useMemo(() => {
     if (mode !== "products") return null;
@@ -182,14 +154,15 @@ function SearchView({
       if (!favOnly) return null;
       return pool
         .map((l) => ({ l, store: stores.find((s) => s.id === l.storeId) }))
+        .filter((r) => r.store)
         .sort((a, b) => a.store.meters - b.store.meters);
     }
     return pool
       .map((l) => {
         const store = stores.find((s) => s.id === l.storeId);
-        return { l, store, s: score(l, store, tokens) };
+        return { l, store, s: store ? score(l, store, tokens) : 0 };
       })
-      .filter((r) => r.s > 0.25)
+      .filter((r) => r.store && r.s > 0.25)
       .sort((a, b) => b.s - a.s || a.store.meters - b.store.meters);
   }, [listings, query, mode, stores, favOnly, favorites.products]);
 
@@ -256,6 +229,14 @@ function SearchView({
             📍 {locStatus === "locating" ? "Locating…" : locStatus === "denied" || locStatus === "unavailable" ? "Distances are estimated · try again" : "Use my location for real distances"}
           </button>
         )}
+
+        {mode === "products" && !query && (
+          <div className="chips">
+            {SUGGESTED.map((s) => (
+              <button key={s} className="chip" onClick={() => setQuery(s)}>{s}</button>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="results">
@@ -291,28 +272,29 @@ function SearchView({
                 <p>{favOnly ? "Tap the heart on a store to save it here and get notified when its stock changes." : "Try a different name or area."}</p>
               </div>
             )
-          ) : (
+          ) : stores.length > 0 ? (
             <>
-              <p className="results-count">Recently searched stores</p>
-              {RECENT_STORE_SEARCHES.map(({ storeId, searches }) => {
-                const s = stores.find((st) => st.id === storeId);
-                if (!s) return null;
-                return (
-                  <div className="storecard-wrap" key={s.id}>
-                    <button className="storecard" onClick={() => onOpenStore(s.id)}>
-                      <span className="storecard-name">{s.name}</span>
-                      <span className="storecard-kind">{s.kind}</span>
-                      <span className="storecard-meta">{s.area} · {searches} searches this week</span>
-                    </button>
-                    <FavHeart
-                      className="storecard-fav"
-                      on={favorites.stores.includes(s.id)}
-                      onClick={() => onToggleFavoriteStore(s.id)}
-                    />
-                  </div>
-                );
-              })}
+              <p className="results-count">Stores near you</p>
+              {stores.map((s) => (
+                <div className="storecard-wrap" key={s.id}>
+                  <button className="storecard" onClick={() => onOpenStore(s.id)}>
+                    <span className="storecard-name">{s.name}</span>
+                    <span className="storecard-kind">{s.kind}</span>
+                    <span className="storecard-meta">{s.area} · {dist(s.meters)}</span>
+                  </button>
+                  <FavHeart
+                    className="storecard-fav"
+                    on={favorites.stores.includes(s.id)}
+                    onClick={() => onToggleFavoriteStore(s.id)}
+                  />
+                </div>
+              ))}
             </>
+          ) : (
+            <div className="empty">
+              <h3>No stores listed yet.</h3>
+              <p>Once a local store sets up here, it'll show up in this list.</p>
+            </div>
           )
         ) : results ? (
           results.length > 0 ? (
@@ -363,16 +345,10 @@ function SearchView({
             </div>
           )
         ) : (
-          <>
-            <p className="results-count">Recently searched products</p>
-            {DEMAND.map((d) => (
-              <button key={d.q} className="storecard" onClick={() => setQuery(d.q)}>
-                <span className="storecard-name">{d.q}</span>
-                <span className="storecard-kind">{d.listed ? "Available nearby" : "Not listed yet"}</span>
-                <span className="storecard-meta">{d.searches} searches this week</span>
-              </button>
-            ))}
-          </>
+          <div className="empty">
+            <h3>Search for a product.</h3>
+            <p>Type what you're looking for above, or tap one of the suggestions.</p>
+          </div>
         )}
       </section>
     </>
@@ -810,7 +786,7 @@ function SellerView({
   const margin = items.reduce((a, l) => a + (l.price - l.cost) * l.unitsWeek, 0);
   const estimatedCostCount = items.filter((l) => l.costEstimated && l.unitsWeek > 0).length;
 
-  const topProducts = [...items].sort((a, b) => b.unitsWeek * b.price - a.unitsWeek * a.price).slice(0, 5);
+  const topProducts = items.filter((l) => l.unitsWeek > 0).sort((a, b) => b.unitsWeek * b.price - a.unitsWeek * a.price).slice(0, 5);
   const topMax = Math.max(1, ...topProducts.map((p) => p.unitsWeek * p.price));
 
   const tokens = norm(q);
@@ -1060,21 +1036,25 @@ function SellerView({
           <div className="cols">
             <section className="panel">
               <div className="panel-head"><h2 className="panel-h">Top products this week</h2></div>
-              <ul className="rank">
-                {topProducts.map((p) => {
-                  const rev = p.unitsWeek * p.price;
-                  return (
-                    <li key={p.id}>
-                      <div className="rank-top">
-                        <span className="rank-name">{p.name}</span>
-                        <span className="rank-val">{peso(rev)}</span>
-                      </div>
-                      <div className="rank-track"><span className="rank-fill" style={{ width: `${(rev / topMax) * 100}%` }} /></div>
-                      <span className="rank-sub">{p.unitsWeek} units · {peso(p.price)} each</span>
-                    </li>
-                  );
-                })}
-              </ul>
+              {topProducts.length > 0 ? (
+                <ul className="rank">
+                  {topProducts.map((p) => {
+                    const rev = p.unitsWeek * p.price;
+                    return (
+                      <li key={p.id}>
+                        <div className="rank-top">
+                          <span className="rank-name">{p.name}</span>
+                          <span className="rank-val">{peso(rev)}</span>
+                        </div>
+                        <div className="rank-track"><span className="rank-fill" style={{ width: `${(rev / topMax) * 100}%` }} /></div>
+                        <span className="rank-sub">{p.unitsWeek} units · {peso(p.price)} each</span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p className="panel-foot">{hasItems ? "No sales recorded yet this week." : "Add your first product to start tracking sales."}</p>
+              )}
             </section>
 
             <section className="panel">
@@ -1401,7 +1381,13 @@ function SellerView({
                     </div>
                   </div>
 
-                  {shown.length === 0 && <p className="panel-foot">Nothing here. Change the filter or clear the search.</p>}
+                  {shown.length === 0 && (
+                    <p className="panel-foot">
+                      {items.length === 0
+                        ? 'No products yet — tap "+ Add product" above to add your first one.'
+                        : "Nothing here. Change the filter or clear the search."}
+                    </p>
+                  )}
 
                   {shown.map((l) => (
                     <button key={l.id} className="inv-compact" onClick={() => setOpenProductId(l.id)}>
