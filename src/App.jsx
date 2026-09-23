@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect, useRef } from "react";
 import { LayoutDashboard, ShoppingCart, Package, Database, Settings, Search, Store, Heart, User, LogOut } from "lucide-react";
+import { App as CapacitorApp } from "@capacitor/app";
 
 /* ------------------------------------------------------------------ *
  * MERON — local store availability + seller dashboard
@@ -45,6 +46,29 @@ const SUGGESTED = ["laptop charger", "cement", "brake pads", "rice", "led bulb"]
 const MY_STORE = "s1";
 
 /* ---------------------------- helpers ---------------------------- */
+
+/* ------------------------- Android back button ------------------------- *
+ * Without this, the hardware back button closes the app from any screen,
+ * because the app never pushes browser history. Each screen or overlay that
+ * can be "backed out of" registers a handler while it's open; a back press
+ * runs the most recently opened one (last in, first out). With nothing
+ * open, back sends the app to the background like any other Android app.
+ */
+const backHandlers = [];
+
+function useBackHandler(active, handler) {
+  const ref = useRef(handler);
+  ref.current = handler;
+  useEffect(() => {
+    if (!active) return;
+    const entry = () => ref.current();
+    backHandlers.push(entry);
+    return () => {
+      const i = backHandlers.lastIndexOf(entry);
+      if (i >= 0) backHandlers.splice(i, 1);
+    };
+  }, [active]);
+}
 
 /* Start of the local calendar day containing t (ms). Sales are bucketed by
    the day they actually happened, using the phone's own clock/timezone. */
@@ -583,6 +607,9 @@ function SellerView({
   const [posPickId, setPosPickId] = useState(null);
   const [posQty, setPosQty] = useState("1");
   const [openReturnTx, setOpenReturnTx] = useState(null);
+
+  useBackHandler(adding, () => setAdding(false));
+  useBackHandler(!!openProductId, () => setOpenProductId(null));
   const [returnQtys, setReturnQtys] = useState({});
 
   /* Live demand: shared storage doesn't push updates, so poll it every 15s
@@ -1829,6 +1856,46 @@ export default function Andito() {
 
   const toggleFavoriteProduct = (id) => requestFavorite("product", id);
   const toggleFavoriteStore = (id) => requestFavorite("store", id);
+
+  /* Registration order sets priority: whatever opened most recently closes
+     first. Screen-level handlers here; screen-internal ones (product detail,
+     add-product form) live in SellerView. */
+  useBackHandler(view === "shop" && !account, () => setView("landing"));
+  useBackHandler(view === "store", () => setView("shop"));
+  useBackHandler(view === "signup", () => {
+    const back = pendingFavorite?.returnView || "shop";
+    setPendingFavorite(null);
+    setView(back);
+  });
+  useBackHandler(view === "seller" && page !== "dashboard", () => setPage("dashboard"));
+  useBackHandler(navOpen, () => setNavOpen(false));
+  useBackHandler(accountMenuOpen, () => setAccountMenuOpen(false));
+
+  useEffect(() => {
+    let handle = null;
+    let cancelled = false;
+    CapacitorApp.addListener("backButton", () => {
+      const top = backHandlers[backHandlers.length - 1];
+      if (top) {
+        top();
+        return;
+      }
+      try {
+        CapacitorApp.minimizeApp().catch(() => {});
+      } catch {
+        // not available (e.g. running in a normal browser) — nothing to do
+      }
+    })
+      .then((h) => {
+        if (cancelled) h.remove();
+        else handle = h;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (handle) handle.remove();
+    };
+  }, []);
 
   /* Real distance for shoppers, opt-in. Nothing is requested automatically —
      browsers (and this sandbox) require a user gesture for a geolocation
