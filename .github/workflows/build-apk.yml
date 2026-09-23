@@ -34,8 +34,17 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # GitHub's Ubuntu build machines already ship with the Android SDK
+      # installed (at $ANDROID_HOME) with its licenses accepted. The old
+      # android-actions/setup-android step re-downloaded Google's tools on
+      # every build and started failing mid-download, so we use the
+      # preinstalled SDK directly instead. Gradle fetches any missing
+      # platform/build-tools version on its own.
+      - name: Use preinstalled Android SDK
+        run: |
+          echo "Android SDK: $ANDROID_HOME"
+          test -d "$ANDROID_HOME" || { echo "No Android SDK found on this runner"; exit 1; }
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
 
       - name: Sync Capacitor Android project
         run: npx cap sync android
