@@ -40,6 +40,14 @@ jobs:
       - name: Sync Capacitor Android project
         run: npx cap sync android
 
+      - name: Generate app icon and splash screen
+        # Builds every Android icon/splash size from the source images in
+        # assets/. Runs here on GitHub because it needs the `sharp` image
+        # library, which doesn't install on Termux. If this step ever fails,
+        # the APK still builds (with the default icon) and the step shows red.
+        continue-on-error: true
+        run: npx --yes @capacitor/assets@3 generate --android
+
       - name: Build debug APK
         working-directory: android
         run: |
