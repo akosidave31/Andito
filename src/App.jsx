@@ -28,8 +28,6 @@ const hoursAgo = (n) => Date.now() - n * 3600000;
    actually added. */
 const LISTINGS = [];
 
-const SALES_THIS_WEEK = [0, 0, 0, 0, 0, 0, 0];
-const SALES_LAST_WEEK = [0, 0, 0, 0, 0, 0, 0];
 
 /* Fallback content for the seller Dashboard's "Searched near you" panel —
    ONLY shown there, clearly labeled "Example" (see isLiveDemand in
@@ -47,6 +45,14 @@ const SUGGESTED = ["laptop charger", "cement", "brake pads", "rice", "led bulb"]
 const MY_STORE = "s1";
 
 /* ---------------------------- helpers ---------------------------- */
+
+/* Start of the local calendar day containing t (ms). Sales are bucketed by
+   the day they actually happened, using the phone's own clock/timezone. */
+const startOfDay = (t) => {
+  const d = new Date(t);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+};
 
 const peso = (n) => "\u20B1" + Math.round(n).toLocaleString("en-PH");
 const pesoShort = (n) => (n >= 1000 ? "\u20B1" + (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : "\u20B1" + n);
@@ -425,7 +431,7 @@ function Kpi({ label, value, note, tone, accent }) {
 }
 
 function SalesChart({ data, prev, labels, selected, onSelect }) {
-  const max = Math.max(...data, ...prev) * 1.15;
+  const max = Math.max(1, ...data, ...prev) * 1.15;
   const pts = prev.map((v, i) => `${((i + 0.5) / prev.length) * 100},${(1 - v / max) * 100}`).join(" ");
 
   return (
@@ -556,7 +562,7 @@ function PinGate({ storeName, correctPin, accountPhone, onUnlock, onForgotPin })
 }
 
 function SellerView({
-  listings, setListings, sales, toast, navOpen, setNavOpen,
+  listings, setListings, toast, navOpen, setNavOpen,
   page, setPage, cart, setCart, transactions, commitSale, commitReturn,
   store, onUpdateProfile, settings, setSettings, onResetDemoData, onLockNow, onSignOut,
 }) {
@@ -712,7 +718,7 @@ function SellerView({
       ["Product", "Brand", "Price", "Cost", "Cost source", "On hand", "Units sold (7d)", "Status", "Low-stock alert at", "Last checked"],
       ...items.map((l) => [
         l.name, l.brand, l.price, l.cost, l.costEstimated ? "Estimated" : "Entered",
-        l.qty, l.unitsWeek, STATUS[l.status].label,
+        l.qty, unitsOf(l), STATUS[l.status].label,
         l.lowAt ?? settings.lowStockThreshold,
         freshness(l.lastCheckedAt).label,
       ]),
@@ -721,8 +727,8 @@ function SellerView({
 
   const exportSales = () => {
     downloadCsv(`${store.name.replace(/\s+/g, "_")}_sales_7d.csv`, [
-      ["Day", "Sales"],
-      ...labels.map((d, i) => [d, sales[i]]),
+      ["Date", "Day", "Net sales"],
+      ...labels.map((d, i) => [new Date(dayStarts[i]).toLocaleDateString("en-CA"), d, sales[i]]),
     ]);
   };
 
@@ -758,23 +764,59 @@ function SellerView({
     });
   };
 
-  const labels = useMemo(() => {
-    const out = [];
-    const now = new Date();
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(now.getDate() - i);
-      out.push(i === 0 ? "Today" : d.toLocaleDateString("en-US", { weekday: "short" }));
-    }
-    return out;
+  /* Sales history is DERIVED from the dated transaction log, never stored as
+     its own array. The old approach kept 7 undated numbers and always added
+     to the last one, so after midnight yesterday's sales kept showing as
+     "today" and the whole chart drifted a day per day. Returns reduce the
+     day of the original sale (net sales by sale date).
+
+     dayKey re-checks the clock every minute so an app left open overnight
+     rolls over to the new day on its own. */
+  const [dayKey, setDayKey] = useState(() => startOfDay(Date.now()));
+  useEffect(() => {
+    const id = setInterval(() => {
+      const k = startOfDay(Date.now());
+      setDayKey((prev) => (prev === k ? prev : k));
+    }, 60000);
+    return () => clearInterval(id);
   }, []);
 
+  const salesStats = useMemo(() => {
+    // 14 local-midnight boundaries, oldest first: 0–6 = last week, 7–13 = this week.
+    const starts = [];
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date(dayKey);
+      d.setDate(d.getDate() - i);
+      starts.push(d.getTime());
+    }
+    const indexOfDay = new Map(starts.map((t, i) => [t, i]));
+    const byDay = new Array(14).fill(0);
+    const units7d = {};
+    transactions.forEach((tx) => {
+      const idx = indexOfDay.get(startOfDay(new Date(tx.time).getTime()));
+      if (idx === undefined) return; // older than 14 days (or clock set backwards)
+      tx.lines.forEach((l) => {
+        const n = l.qty - (l.returnedQty || 0);
+        if (n <= 0) return;
+        byDay[idx] += n * l.price;
+        if (idx >= 7) units7d[l.id] = (units7d[l.id] || 0) + n;
+      });
+    });
+    const labels = starts
+      .slice(7)
+      .map((t, i) => (i === 6 ? "Today" : new Date(t).toLocaleDateString("en-US", { weekday: "short" })));
+    return { thisWeek: byDay.slice(7), lastWeek: byDay.slice(0, 7), units7d, labels, dayStarts: starts.slice(7) };
+  }, [transactions, dayKey]);
+
+  const { thisWeek: sales, lastWeek: salesLastWeek, units7d, labels, dayStarts } = salesStats;
+  const unitsOf = (l) => units7d[l.id] || 0;
+
   const today = sales[6];
-  const lastWeekToday = SALES_LAST_WEEK[6];
-  const delta = lastWeekToday ? Math.round(((today - lastWeekToday) / lastWeekToday) * 100) : 0;
+  const lastWeekToday = salesLastWeek[6];
+  const delta = lastWeekToday ? Math.round(((today - lastWeekToday) / lastWeekToday) * 100) : null;
   const weekTotal = sales.reduce((a, b) => a + b, 0);
-  const prevTotal = SALES_LAST_WEEK.reduce((a, b) => a + b, 0);
-  const weekDelta = Math.round(((weekTotal - prevTotal) / prevTotal) * 100);
+  const prevTotal = salesLastWeek.reduce((a, b) => a + b, 0);
+  const weekDelta = prevTotal ? Math.round(((weekTotal - prevTotal) / prevTotal) * 100) : null;
 
   const stockValue = items.reduce((a, l) => a + (l.qty || 0) * l.cost, 0);
   const outCount = items.filter((l) => l.status === "out").length;
@@ -782,12 +824,12 @@ function SellerView({
   const staleItems = items.filter((l) => freshness(l.lastCheckedAt).key !== "fresh");
   const hasItems = items.length > 0;
   const freshPct = hasItems ? Math.round(((items.length - staleItems.length) / items.length) * 100) : null;
-  const unitsWeek = items.reduce((a, l) => a + l.unitsWeek, 0);
-  const margin = items.reduce((a, l) => a + (l.price - l.cost) * l.unitsWeek, 0);
-  const estimatedCostCount = items.filter((l) => l.costEstimated && l.unitsWeek > 0).length;
+  const unitsWeek = items.reduce((a, l) => a + unitsOf(l), 0);
+  const margin = items.reduce((a, l) => a + (l.price - l.cost) * unitsOf(l), 0);
+  const estimatedCostCount = items.filter((l) => l.costEstimated && unitsOf(l) > 0).length;
 
-  const topProducts = items.filter((l) => l.unitsWeek > 0).sort((a, b) => b.unitsWeek * b.price - a.unitsWeek * a.price).slice(0, 5);
-  const topMax = Math.max(1, ...topProducts.map((p) => p.unitsWeek * p.price));
+  const topProducts = items.filter((l) => unitsOf(l) > 0).sort((a, b) => unitsOf(b) * b.price - unitsOf(a) * a.price).slice(0, 5);
+  const topMax = Math.max(1, ...topProducts.map((p) => unitsOf(p) * p.price));
 
   const tokens = norm(q);
   const shown = items.filter((l) => {
@@ -814,8 +856,8 @@ function SellerView({
 
   /* Direct correction for a mistyped on-hand count — e.g. meant to restock
      10, fat-fingered 13. This sets the exact number rather than adding or
-     subtracting, and unlike a sale or restock it doesn't touch unitsWeek
-     or sales — it's a fix, not a transaction. */
+     subtracting, and unlike a sale it doesn't create a transaction, so it
+     never shows up in sales figures — it's a fix, not a sale. */
   const saveQtyEdit = (l) => {
     const newQty = Math.max(0, Number(qtyDraft) || 0);
     if (newQty !== l.qty) {
@@ -837,7 +879,7 @@ function SellerView({
     const costEntered = draft.cost.trim() !== "";
     const cost = costEntered ? Math.max(0, Number(draft.cost) || 0) : Math.round(price * 0.7);
     setListings((prev) => [
-      { id: "n" + Date.now(), storeId: MY_STORE, name: draft.name.trim(), brand: "—", specs: [], price, cost, costEstimated: !costEntered, qty, unitsWeek: 0, status: statusFromQty(qty, settings.lowStockThreshold), lastCheckedAt: Date.now() },
+      { id: "n" + Date.now(), storeId: MY_STORE, name: draft.name.trim(), brand: "—", specs: [], price, cost, costEstimated: !costEntered, qty, status: statusFromQty(qty, settings.lowStockThreshold), lastCheckedAt: Date.now() },
       ...prev,
     ]);
     setDraft({ name: "", price: "", qty: "", cost: "" });
@@ -969,8 +1011,8 @@ function SellerView({
               label="Sales today"
               value={peso(today)}
               accent="blue"
-              tone={weekTotal === 0 ? "flat" : delta >= 0 ? "up" : "down"}
-              note={weekTotal === 0 ? "No sales yet" : `${delta >= 0 ? "▲" : "▼"} ${Math.abs(delta)}% vs last week`}
+              tone={weekTotal === 0 || delta === null ? "flat" : delta >= 0 ? "up" : "down"}
+              note={weekTotal === 0 ? "No sales yet" : delta === null ? "No sales same day last week" : `${delta >= 0 ? "▲" : "▼"} ${Math.abs(delta)}% vs last week`}
             />
             <Kpi
               label="Gross margin, 7d"
@@ -1016,17 +1058,17 @@ function SellerView({
                 {weekTotal === 0 ? (
                   "No sales recorded yet"
                 ) : (
-                  <>{peso(weekTotal)} total <span className={weekDelta >= 0 ? "up" : "down"}>{weekDelta >= 0 ? "▲" : "▼"} {Math.abs(weekDelta)}%</span></>
+                  <>{peso(weekTotal)} total{weekDelta === null ? " · first week of data" : <> <span className={weekDelta >= 0 ? "up" : "down"}>{weekDelta >= 0 ? "▲" : "▼"} {Math.abs(weekDelta)}%</span></>}</>
                 )}
               </p>
             </div>
-            <SalesChart data={sales} prev={SALES_LAST_WEEK} labels={labels} selected={pickedDay} onSelect={setPickedDay} />
+            <SalesChart data={sales} prev={salesLastWeek} labels={labels} selected={pickedDay} onSelect={setPickedDay} />
             <p className="chart-read">
               {pickedDay === null ? (
                 <>Dashed line is the same days last week. Tap a bar for detail.</>
               ) : (
                 <>
-                  <strong>{labels[pickedDay]}</strong> · {peso(sales[pickedDay])} this week vs {peso(SALES_LAST_WEEK[pickedDay])} last week
+                  <strong>{labels[pickedDay]}</strong> · {peso(sales[pickedDay])} this week vs {peso(salesLastWeek[pickedDay])} last week
                 </>
               )}
             </p>
@@ -1039,7 +1081,7 @@ function SellerView({
               {topProducts.length > 0 ? (
                 <ul className="rank">
                   {topProducts.map((p) => {
-                    const rev = p.unitsWeek * p.price;
+                    const rev = unitsOf(p) * p.price;
                     return (
                       <li key={p.id}>
                         <div className="rank-top">
@@ -1047,7 +1089,7 @@ function SellerView({
                           <span className="rank-val">{peso(rev)}</span>
                         </div>
                         <div className="rank-track"><span className="rank-fill" style={{ width: `${(rev / topMax) * 100}%` }} /></div>
-                        <span className="rank-sub">{p.unitsWeek} units · {peso(p.price)} each</span>
+                        <span className="rank-sub">{unitsOf(p)} units · {peso(p.price)} each</span>
                       </li>
                     );
                   })}
@@ -1280,7 +1322,7 @@ function SellerView({
 
                     <div className="product-detail-row">
                       <span className="inv-k">7d</span>
-                      <span className="product-detail-value">{l.unitsWeek}</span>
+                      <span className="product-detail-value">{unitsOf(l)}</span>
                     </div>
 
                     <div className="seg">
@@ -1585,13 +1627,13 @@ function SellerView({
           </section>
 
           <section className="panel panel-alert">
-            <div className="panel-head"><h2 className="panel-h">Reset demo data</h2></div>
-            <p className="panel-note" style={{ marginBottom: 12 }}>Clears every change you've made and restores the sample inventory and sales this demo ships with.</p>
+            <div className="panel-head"><h2 className="panel-h">Clear store data</h2></div>
+            <p className="panel-note" style={{ marginBottom: 12 }}>Deletes every product and every sale on this phone. This can't be undone — export first if you need a copy.</p>
             {!resetConfirm ? (
-              <button className="btn btn-ghost btn-sm" onClick={() => setResetConfirm(true)}>Reset to demo data</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setResetConfirm(true)}>Clear store data</button>
             ) : (
               <div className="settings-row">
-                <button className="btn btn-primary btn-sm" onClick={() => { onResetDemoData(); setResetConfirm(false); }}>Yes, reset everything</button>
+                <button className="btn btn-primary btn-sm" onClick={() => { onResetDemoData(); setResetConfirm(false); }}>Yes, delete everything</button>
                 <button className="btn btn-ghost btn-sm" onClick={() => setResetConfirm(false)}>Cancel</button>
               </div>
             )}
@@ -1687,7 +1729,6 @@ function SignupView({ onContinue, onSkip }) {
 
 export default function Andito() {
   const [listings, setListings] = useState(LISTINGS);
-  const [sales, setSales] = useState(SALES_THIS_WEEK);
   const [view, setView] = useState("landing");
   const [account, setAccount] = useState(null); // { role: "searcher" | "owner", phone } | null
   const [storeId, setStoreId] = useState(null);
@@ -1750,7 +1791,8 @@ export default function Andito() {
           if (Array.isArray(saved.myListings)) {
             setListings((prev) => [...prev.filter((l) => l.storeId !== MY_STORE), ...saved.myListings]);
           }
-          if (Array.isArray(saved.sales) && saved.sales.length === 7) setSales(saved.sales);
+          // saved.sales (the old undated 7-slot array) is intentionally ignored:
+          // sales figures are rebuilt from the dated transaction log below.
           if (Array.isArray(saved.transactions)) {
             setTransactions(saved.transactions.map((t) => ({ ...t, time: new Date(t.time) })));
           }
@@ -1838,9 +1880,9 @@ export default function Andito() {
   useEffect(() => {
     if (!loaded) return;
     const myListings = listings.filter((l) => l.storeId === MY_STORE);
-    const payload = { account, storeProfile, myListings, sales, transactions, settings, favorites, cart };
+    const payload = { account, storeProfile, myListings, transactions, settings, favorites, cart };
     window.storage.set("app-state", JSON.stringify(payload)).catch(() => {});
-  }, [loaded, account, storeProfile, listings, sales, transactions, settings, favorites, cart]);
+  }, [loaded, account, storeProfile, listings, transactions, settings, favorites, cart]);
 
   /* Notify on restocks for anything the user has favorited — either the
      product itself, or any item at a favorited store. Only fires on view
@@ -1898,10 +1940,9 @@ export default function Andito() {
 
   const resetDemoData = () => {
     setListings(LISTINGS);
-    setSales(SALES_THIS_WEEK);
     setTransactions([]);
     setCart([]);
-    toast("Demo data reset.");
+    toast("Store data cleared.");
   };
 
   /* A fresh "I have a store" signup already starts with a blank profile
@@ -1912,7 +1953,6 @@ export default function Andito() {
      actually means "blank store." */
   const startFreshOwnerAccount = () => {
     setListings((prev) => prev.filter((l) => l.storeId !== MY_STORE));
-    setSales(Array(7).fill(0));
     setTransactions([]);
     setCart([]);
     setOwnerConfigured(true);
@@ -1928,10 +1968,9 @@ export default function Andito() {
         const line = lines.find((c) => c.id === l.id);
         if (!line) return l;
         const newQty = Math.max(0, (l.qty || 0) - line.qty);
-        return { ...l, qty: newQty, unitsWeek: l.unitsWeek + line.qty, status: statusFromQty(newQty, l.lowAt ?? settings.lowStockThreshold), lastCheckedAt: Date.now() };
+        return { ...l, qty: newQty, status: statusFromQty(newQty, l.lowAt ?? settings.lowStockThreshold), lastCheckedAt: Date.now() };
       })
     );
-    setSales((prev) => prev.map((v, i) => (i === 6 ? v + total : v)));
     setTransactions((prev) => [
       {
         id: "t" + Date.now(),
@@ -1959,10 +1998,9 @@ export default function Andito() {
       prev.map((l) => {
         if (l.id !== line.id) return l;
         const newQty = (l.qty || 0) + qty;
-        return { ...l, qty: newQty, unitsWeek: Math.max(0, l.unitsWeek - qty), status: statusFromQty(newQty, l.lowAt ?? settings.lowStockThreshold), lastCheckedAt: Date.now() };
+        return { ...l, qty: newQty, status: statusFromQty(newQty, l.lowAt ?? settings.lowStockThreshold), lastCheckedAt: Date.now() };
       })
     );
-    setSales((prev) => prev.map((v, i) => (i === 6 ? Math.max(0, v - qty * line.price) : v)));
     setTransactions((prev) =>
       prev.map((tx) =>
         tx.id === t.id
@@ -2588,7 +2626,6 @@ export default function Andito() {
                 <SellerView
                   listings={listings}
                   setListings={setListings}
-                  sales={sales}
                   toast={toast}
                   navOpen={navOpen}
                   setNavOpen={setNavOpen}
