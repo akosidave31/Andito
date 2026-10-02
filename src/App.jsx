@@ -1,6 +1,9 @@
 import { useState, useMemo, useEffect, useRef } from "react";
 import { LayoutDashboard, ShoppingCart, Package, Database, Settings, Search, Store, Heart, User, LogOut } from "lucide-react";
 import { App as CapacitorApp } from "@capacitor/app";
+import { Capacitor } from "@capacitor/core";
+import { Filesystem, Directory, Encoding } from "@capacitor/filesystem";
+import { Share } from "@capacitor/share";
 
 /* ------------------------------------------------------------------ *
  * MERON — local store availability + seller dashboard
@@ -77,6 +80,24 @@ const startOfDay = (t) => {
   d.setHours(0, 0, 0, 0);
   return d.getTime();
 };
+
+/* Returns null if `data` is an Andito backup this version can restore,
+   or a message saying why not. Checked before anything on the phone is
+   touched, so a wrong or damaged file can never wipe the store. */
+const BACKUP_VERSION = 1;
+const checkBackup = (data) => {
+  if (!data || data.app !== "andito") return "That file isn't an Andito backup.";
+  if (typeof data.backupVersion === "number" && data.backupVersion > BACKUP_VERSION)
+    return "This backup was made by a newer version of Andito. Update the app first.";
+  if (data.backupVersion !== BACKUP_VERSION) return "This backup file is damaged.";
+  if (!Array.isArray(data.listings) || !Array.isArray(data.transactions)) return "This backup file is damaged.";
+  if (data.listings.some((l) => !l || typeof l.id !== "string" || typeof l.name !== "string"))
+    return "This backup file is damaged.";
+  if (data.transactions.some((t) => !t || !Array.isArray(t.lines))) return "This backup file is damaged.";
+  return null;
+};
+
+const DAY_MS = 86400000;
 
 const peso = (n) => "\u20B1" + Math.round(n).toLocaleString("en-PH");
 const pesoShort = (n) => (n >= 1000 ? "\u20B1" + (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : "\u20B1" + n);
@@ -588,7 +609,7 @@ function PinGate({ storeName, correctPin, accountPhone, onUnlock, onForgotPin })
 function SellerView({
   listings, setListings, toast, navOpen, setNavOpen,
   page, setPage, cart, setCart, transactions, commitSale, commitReturn,
-  store, onUpdateProfile, settings, setSettings, onResetDemoData, onLockNow, onSignOut,
+  store, onUpdateProfile, settings, setSettings, onResetDemoData, onRestoreBackup, onLockNow, onSignOut,
 }) {
   const items = listings.filter((l) => l.storeId === MY_STORE);
 
@@ -609,6 +630,12 @@ function SellerView({
   const [openReturnTx, setOpenReturnTx] = useState(null);
 
   useBackHandler(adding, () => setAdding(false));
+
+  /* Restore: the owner picks a backup file, we check it, then ask before
+     replacing anything. */
+  const restoreInputRef = useRef(null);
+  const [pendingRestore, setPendingRestore] = useState(null); // { data, fileName } | null
+  useBackHandler(!!pendingRestore, () => setPendingRestore(null));
   useBackHandler(!!openProductId, () => setOpenProductId(null));
   const [returnQtys, setReturnQtys] = useState({});
 
@@ -656,12 +683,16 @@ function SellerView({
 
   /* ------------------------ Data / Settings tabs ------------------------ */
   const [profileDraft, setProfileDraft] = useState(store);
+  // Pick up profile changes made outside this form (a restored backup),
+  // so pressing "Save profile" can't overwrite them with stale values.
+  useEffect(() => {
+    setProfileDraft(store);
+  }, [store.name, store.kind, store.area, store.hours, store.phone]);
   const [profileSaved, setProfileSaved] = useState(false);
   const [pinStep, setPinStep] = useState("idle"); // idle | setting
   const [pinDraft, setPinDraft] = useState("");
   const [pinConfirm, setPinConfirm] = useState("");
   const [pinError, setPinError] = useState("");
-  const [lastBackup, setLastBackup] = useState(null);
   const [resetConfirm, setResetConfirm] = useState(false);
   const [locating, setLocating] = useState(false);
   const [locateError, setLocateError] = useState("");
@@ -728,20 +759,103 @@ function SellerView({
     toast("Store profile updated.");
   };
 
-  const downloadCsv = (filename, rows) => {
-    const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    setLastBackup(new Date());
-    toast(`${filename} downloaded.`);
+  /* Inside the Android app, a browser-style download link is silently
+     ignored, so the old export said "downloaded" while no file was ever
+     saved. In the app we now write the CSV to the app's cache folder and
+     open Android's share menu, so the owner picks where it goes (Google
+     Drive, Messenger, Gmail, Files). The download link is kept only for
+     running in a normal browser, where it does work. */
+  const [exporting, setExporting] = useState(false);
+
+  const fileBaseName = () =>
+    (store.name || "").trim().replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "andito";
+  const dateStamp = () => new Date().toLocaleDateString("en-CA");
+
+  // Saves `content` as a file and lets the owner pick where it goes.
+  // Returns true only if the file was actually saved or shared.
+  const shareFile = async (filename, content, mime) => {
+    if (exporting) return false;
+
+    if (!Capacitor.isNativePlatform()) {
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast(`${filename} downloaded.`);
+      return true;
+    }
+
+    setExporting(true);
+    try {
+      const { uri } = await Filesystem.writeFile({
+        path: filename,
+        data: content,
+        directory: Directory.Cache,
+        encoding: Encoding.UTF8,
+      });
+      await Share.share({ title: filename, files: [uri], dialogTitle: "Save or send" });
+      toast(`${filename} shared.`);
+      return true;
+    } catch (e) {
+      const msg = String(e?.message || e);
+      toast(/cancel/i.test(msg) ? "Canceled. Nothing was shared." : `Couldn't share the file: ${msg}`);
+      return false;
+    } finally {
+      setExporting(false);
+    }
   };
 
+  const exportCsv = (kind, rows) => {
+    // Leading BOM so Excel reads ₱ and accented names as UTF-8 instead of garbling them.
+    const csv =
+      "﻿" + rows.map((r) => r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+    return shareFile(`${fileBaseName()}_${kind}_${dateStamp()}.csv`, csv, "text/csv;charset=utf-8;");
+  };
+
+  /* A full backup the app can restore from. The CSV exports are for reading
+     in Excel and can't be restored. The PIN is left out on purpose: the file
+     may travel through Messenger or Drive, and a restore keeps this phone's
+     own PIN anyway. */
+  const backupStore = async () => {
+    const data = {
+      app: "andito",
+      backupVersion: BACKUP_VERSION,
+      createdAt: new Date().toISOString(),
+      storeProfile: { name: store.name, kind: store.kind, area: store.area, hours: store.hours, phone: store.phone },
+      listings: items,
+      transactions,
+      settings: { lowStockThreshold: settings.lowStockThreshold, language: settings.language },
+    };
+    const ok = await shareFile(`${fileBaseName()}_backup_${dateStamp()}.json`, JSON.stringify(data), "application/json");
+    if (ok) setSettings((s) => ({ ...s, lastBackupAt: Date.now() }));
+  };
+
+  const onRestoreFilePicked = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // so picking the same file again still fires
+    if (!file) return;
+    let data;
+    try {
+      data = JSON.parse(await file.text());
+    } catch {
+      toast("That file isn't an Andito backup.");
+      return;
+    }
+    const problem = checkBackup(data);
+    if (problem) {
+      toast(problem);
+      return;
+    }
+    setPendingRestore({ data, fileName: file.name });
+  };
+
+  const lastBackupAt = settings.lastBackupAt || null;
+  const backupOverdue = items.length > 0 && (!lastBackupAt || Date.now() - lastBackupAt > 7 * DAY_MS);
+
   const exportInventory = () => {
-    downloadCsv(`${store.name.replace(/\s+/g, "_")}_inventory.csv`, [
+    exportCsv("inventory", [
       ["Product", "Brand", "Price", "Cost", "Cost source", "On hand", "Units sold (7d)", "Status", "Low-stock alert at", "Last checked"],
       ...items.map((l) => [
         l.name, l.brand, l.price, l.cost, l.costEstimated ? "Estimated" : "Entered",
@@ -753,7 +867,7 @@ function SellerView({
   };
 
   const exportSales = () => {
-    downloadCsv(`${store.name.replace(/\s+/g, "_")}_sales_7d.csv`, [
+    exportCsv("sales_7d", [
       ["Date", "Day", "Net sales"],
       ...labels.map((d, i) => [new Date(dayStarts[i]).toLocaleDateString("en-CA"), d, sales[i]]),
     ]);
@@ -1058,7 +1172,7 @@ function SellerView({
           </div>
 
           {/* Needs attention */}
-          {(outCount > 0 || lowCount > 0 || staleItems.length > 0) && (
+          {(outCount > 0 || lowCount > 0 || staleItems.length > 0 || backupOverdue) && (
             <section className="panel panel-alert">
               <div className="panel-head">
                 <h2 className="panel-h">Needs attention</h2>
@@ -1072,6 +1186,9 @@ function SellerView({
                 )}
                 {staleItems.length > 0 && (
                   <li><span className="dot dot-stale" /><span>{staleItems.length} listings haven't been checked in over a day. Shoppers see these last.</span><button className="link" onClick={() => { setPage("inventory"); setFilter("stale"); }}>Show</button></li>
+                )}
+                {backupOverdue && (
+                  <li><span className="dot dot-low" /><span>{lastBackupAt ? `Last backup was ${Math.floor((Date.now() - lastBackupAt) / DAY_MS)} days ago.` : "Your store has never been backed up."} If this phone is lost, your products and sales go with it.</span><button className="link" onClick={() => setPage("data")}>Back up</button></li>
                 )}
               </ul>
             </section>
@@ -1635,27 +1752,49 @@ function SellerView({
             </div>
           </header>
 
-          <section className="panel">
-            <div className="panel-head"><h2 className="panel-h">Backup status</h2></div>
-            <p className="panel-note">
-              {lastBackup
-                ? <>Last exported <strong>{lastBackup.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</strong> today.</>
-                : "Not exported yet this session."}
+          <section className={`panel ${backupOverdue ? "panel-alert" : ""}`}>
+            <div className="panel-head"><h2 className="panel-h">Backup &amp; restore</h2></div>
+            <p className="panel-note" style={{ marginBottom: 12 }}>
+              {lastBackupAt
+                ? <>Last backup: <strong>{new Date(lastBackupAt).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}</strong>.</>
+                : "No backup yet."}{" "}
+              Your store is saved only on this phone. A backup file keeps your products, sales and store profile safe. Save it to Google Drive or send it to yourself.
             </p>
+            <div className="settings-row">
+              <button className="btn btn-primary btn-sm" onClick={backupStore} disabled={exporting}>Back up store</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => restoreInputRef.current?.click()} disabled={exporting}>Restore from backup</button>
+              <input ref={restoreInputRef} type="file" style={{ display: "none" }} onChange={onRestoreFilePicked} />
+            </div>
+            <p className="panel-note" style={{ marginTop: 10 }}>On a new phone: sign up as a store first, then come here and restore.</p>
+
+            {pendingRestore && (
+              <div className="addbox" style={{ marginTop: 12 }}>
+                <p className="panel-note">
+                  Restore <strong>{pendingRestore.fileName}</strong>
+                  {pendingRestore.data.createdAt && <> from {new Date(pendingRestore.data.createdAt).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}</>}?
+                  {" "}It has {pendingRestore.data.listings.length} products and {pendingRestore.data.transactions.length} sales.
+                  {" "}Everything on this phone now will be replaced. Your PIN stays the same.
+                </p>
+                <div className="settings-row">
+                  <button className="btn btn-primary btn-sm" onClick={() => { onRestoreBackup(pendingRestore.data); setPendingRestore(null); }}>Yes, replace with backup</button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => setPendingRestore(null)}>Cancel</button>
+                </div>
+              </div>
+            )}
           </section>
 
           <section className="panel">
             <div className="panel-head"><h2 className="panel-h">Export</h2></div>
-            <p className="panel-note" style={{ marginBottom: 12 }}>Download a CSV you can open in Excel or Google Sheets, or hand to your accountant.</p>
+            <p className="panel-note" style={{ marginBottom: 12 }}>Makes a CSV file you can open in Excel or Google Sheets. Pick where it goes, such as Google Drive, Messenger or email. These are for reading, not for restoring. Use "Back up store" for that.</p>
             <div className="settings-row">
-              <button className="btn btn-primary btn-sm" onClick={exportInventory}>Export inventory</button>
-              <button className="btn btn-ghost btn-sm" onClick={exportSales}>Export sales (7d)</button>
+              <button className="btn btn-primary btn-sm" onClick={exportInventory} disabled={exporting}>Export inventory</button>
+              <button className="btn btn-ghost btn-sm" onClick={exportSales} disabled={exporting}>Export sales (7d)</button>
             </div>
           </section>
 
           <section className="panel panel-alert">
             <div className="panel-head"><h2 className="panel-h">Clear store data</h2></div>
-            <p className="panel-note" style={{ marginBottom: 12 }}>Deletes every product and every sale on this phone. This can't be undone — export first if you need a copy.</p>
+            <p className="panel-note" style={{ marginBottom: 12 }}>Deletes every product and every sale on this phone. This can't be undone. Back up first if you need a copy.</p>
             {!resetConfirm ? (
               <button className="btn btn-ghost btn-sm" onClick={() => setResetConfirm(true)}>Clear store data</button>
             ) : (
@@ -2023,6 +2162,38 @@ export default function Andito() {
     setTransactions([]);
     setCart([]);
     setOwnerConfigured(true);
+  };
+
+  /* Replaces this phone's store with a backup's contents. The file was
+     already checked by checkBackup. Only the owner's own store is touched,
+     and phone-specific settings (PIN, last-backup date) stay as they are.
+     Missing product fields get safe defaults so an older or hand-edited
+     backup can't crash the inventory screen. */
+  const restoreBackup = (data) => {
+    const restored = data.listings.map((l) => ({
+      brand: "—",
+      specs: [],
+      price: 0,
+      cost: 0,
+      qty: 0,
+      status: "in",
+      ...l,
+      storeId: MY_STORE,
+      lastCheckedAt: typeof l.lastCheckedAt === "number" ? l.lastCheckedAt : Date.now(),
+    }));
+    setListings((prev) => [...prev.filter((l) => l.storeId !== MY_STORE), ...restored]);
+    setTransactions(data.transactions.map((t) => ({ ...t, time: new Date(t.time) })));
+    if (data.storeProfile) setStoreProfile((p) => ({ ...p, ...data.storeProfile }));
+    if (data.settings) {
+      setSettings((s) => ({
+        ...s,
+        ...(typeof data.settings.lowStockThreshold === "number" ? { lowStockThreshold: data.settings.lowStockThreshold } : {}),
+        ...(typeof data.settings.language === "string" ? { language: data.settings.language } : {}),
+      }));
+    }
+    setCart([]);
+    setOwnerConfigured(true);
+    toast(`Backup restored: ${restored.length} products, ${data.transactions.length} sales.`);
   };
 
   /* Single path for every sale, whether it came from POS or from Inventory. */
@@ -2708,6 +2879,7 @@ export default function Andito() {
                   settings={settings}
                   setSettings={setSettings}
                   onResetDemoData={resetDemoData}
+                  onRestoreBackup={restoreBackup}
                   onLockNow={() => setPinUnlocked(false)}
                   onSignOut={() => { setAccount(null); setPinUnlocked(false); setView("shop"); toast("Signed out."); }}
                 />
