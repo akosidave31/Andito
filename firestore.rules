@@ -16,11 +16,23 @@ service cloud.firestore {
       return request.auth != null && request.auth.uid == storeId;
     }
 
+    // Optional map pin: missing, null, or a real coordinate.
+    function validCoord(data, key, lo, hi) {
+      return data.get(key, null) == null
+        || (data[key] is number && data[key] >= lo && data[key] <= hi);
+    }
+
+    // Lets the Shop screen load every store's products in one query.
+    // Read-only: writes still go through the owner-only rules below.
+    match /{path=**}/listings/{listingId} {
+      allow read: if true;
+    }
+
     match /stores/{storeId} {
       allow read: if true;
       allow delete: if isOwner(storeId);
       allow create, update: if isOwner(storeId)
-        && request.resource.data.keys().hasOnly(['ownerUid', 'name', 'kind', 'area', 'hours', 'phone', 'productCount', 'updatedAt'])
+        && request.resource.data.keys().hasOnly(['ownerUid', 'name', 'kind', 'area', 'hours', 'phone', 'productCount', 'updatedAt', 'lat', 'lng'])
         && request.resource.data.ownerUid == storeId
         && request.resource.data.name is string
         && request.resource.data.name.size() > 0
@@ -29,7 +41,9 @@ service cloud.firestore {
         && request.resource.data.area is string && request.resource.data.area.size() <= 200
         && request.resource.data.hours is string && request.resource.data.hours.size() <= 80
         && request.resource.data.phone is string && request.resource.data.phone.size() <= 30
-        && request.resource.data.productCount is int;
+        && request.resource.data.productCount is int
+        && validCoord(request.resource.data, 'lat', -90, 90)
+        && validCoord(request.resource.data, 'lng', -180, 180);
 
       match /listings/{listingId} {
         allow read: if true;

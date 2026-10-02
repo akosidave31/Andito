@@ -12,7 +12,7 @@
  */
 import { initializeApp } from "firebase/app";
 import { initializeAuth, indexedDBLocalPersistence, signInAnonymously } from "firebase/auth";
-import { getFirestore, doc, collection, getDocs, writeBatch, serverTimestamp } from "firebase/firestore";
+import { getFirestore, doc, collection, collectionGroup, getDocs, writeBatch, serverTimestamp } from "firebase/firestore";
 
 const firebaseConfig = {
   apiKey: "AIzaSyCjBRm5peWQinIymyams6-WBVau2ivvzPw",
@@ -49,7 +49,21 @@ export async function ensureSignedIn() {
   return cred.user.uid;
 }
 
+/* This phone's Firebase user id if it has ever signed in (i.e. it publishes
+   a store), without creating an account just to look. Used so the Shop
+   screen doesn't show the owner their own store twice. */
+export async function currentUidIfSignedIn() {
+  await auth.authStateReady();
+  return auth.currentUser ? auth.currentUser.uid : null;
+}
+
 const clip = (v, n) => String(v ?? "").trim().slice(0, n);
+
+// 5 decimal places is about 1 metre: precise enough to find a store's door.
+const coord = (v, max) => {
+  const n = Number(v);
+  return v != null && v !== "" && Number.isFinite(n) && Math.abs(n) <= max ? Math.round(n * 1e5) / 1e5 : null;
+};
 
 /* The public shape of a store. Every field here is visible to anyone, so
    only add fields the owner has been told will be public. The fixed key
@@ -63,6 +77,10 @@ export function publicStoreDoc(uid, profile, productCount) {
     hours: clip(profile.hours, 80),
     phone: clip(profile.phone, 30),
     productCount,
+    // Map pin, set by the owner while at the store. null = not pinned, and
+    // shoppers then see the address without a distance.
+    lat: coord(profile.lat, 90),
+    lng: coord(profile.lng, 180),
   };
 }
 
@@ -137,6 +155,56 @@ export async function pushChanges(uid, profile, listings, remote, lastStoreFinge
 
   await commitInChunks(ops);
   return { remote: nextRemote, storeFingerprint: storeFp, writes: ops.length };
+}
+
+/* Everything shoppers can browse: every published store, plus every product
+   of every store in ONE query (a "collection group" query over all the
+   listings collections). Each product read counts toward Firebase's free
+   daily limit, which is why the Shop screen caches this and doesn't reload
+   it on every visit (see marketplace.js). */
+export async function fetchMarketplace() {
+  const [storeSnap, listingSnap] = await Promise.all([
+    getDocs(collection(db, "stores")),
+    getDocs(collectionGroup(db, "listings")),
+  ]);
+
+  const stores = storeSnap.docs
+    .map((d) => {
+      const s = d.data();
+      return {
+        id: d.id,
+        name: clip(s.name, 80),
+        kind: clip(s.kind, 80),
+        area: clip(s.area, 200),
+        hours: clip(s.hours, 80),
+        phone: clip(s.phone, 30),
+        lat: coord(s.lat, 90),
+        lng: coord(s.lng, 180),
+      };
+    })
+    .filter((s) => s.name);
+
+  const storeIds = new Set(stores.map((s) => s.id));
+  const listings = listingSnap.docs
+    .map((d) => {
+      const storeId = d.ref.parent.parent ? d.ref.parent.parent.id : null;
+      const l = publicListingDoc(d.data());
+      return {
+        // Prefixed so another store's product can never collide with one of
+        // this phone's own product ids.
+        id: `r:${storeId}:${d.id}`,
+        storeId,
+        name: l.name,
+        brand: l.brand || "—",
+        specs: l.specs,
+        price: l.price,
+        status: l.status,
+        lastCheckedAt: l.lastCheckedAt || null,
+      };
+    })
+    .filter((l) => storeIds.has(l.storeId)); // skip products whose store is gone
+
+  return { stores, listings };
 }
 
 /* Removes the store and every product from Firebase. Products go first

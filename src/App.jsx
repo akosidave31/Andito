@@ -5,6 +5,7 @@ import { Capacitor } from "@capacitor/core";
 import { Filesystem, Directory, Encoding } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
 import { useStoreSync, isProfileComplete } from "./storeSync.js";
+import { useMarketplace } from "./marketplace.js";
 
 /* ------------------------------------------------------------------ *
  * MERON — local store availability + seller dashboard
@@ -16,11 +17,11 @@ import { useStoreSync, isProfileComplete } from "./storeSync.js";
    stores and no fictional products. name/kind/area/hours/phone start blank
    (the same shape a first-time "I have a store" signup already produces),
    so a real owner's very first launch is a genuinely empty marketplace, not
-   someone else's demo inventory. lat/lng/fallbackMeters stay populated so
-   distance math doesn't NaN before the owner sets a real location — it's
-   inert until the store actually has a name and shows up anywhere. */
+   someone else's demo inventory. Its map position comes only from the
+   owner pinning it (storeProfile.lat/lng); until then it has no distance.
+   Other stores come from Firebase (see marketplace.js). */
 const STORES = [
-  { id: "s1", name: "", kind: "", area: "", lat: 14.173371, lng: 121.204259, fallbackMeters: 400, hours: "", phone: "" },
+  { id: "s1", name: "", kind: "", area: "", hours: "", phone: "" },
 ];
 
 /* Seed listings are written as "checked N hours ago" for readability, then
@@ -122,7 +123,15 @@ const STATUS = {
 };
 
 const statusFromQty = (q, lowAt = 3) => (q <= 0 ? "out" : q <= lowAt ? "low" : "in");
-const dist = (m) => (m < 1000 ? `${m} m` : `${(m / 1000).toFixed(1)} km`);
+// meters is null when either the shopper's or the store's location is unknown.
+const dist = (m) => (m == null ? "" : m < 1000 ? `${m} m` : `${(m / 1000).toFixed(1)} km`);
+// Sort helper: stores with a known distance first, nearest first.
+const byMeters = (a, b) => {
+  if (a == null && b == null) return 0;
+  if (a == null) return 1;
+  if (b == null) return -1;
+  return a - b;
+};
 const norm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
 
 function score(listing, store, tokens) {
@@ -179,7 +188,7 @@ function FavHeart({ on, onClick, className = "", size = 16 }) {
 function SearchView({
   stores: allStores, listings, query, setQuery, onOpenStore,
   favorites, onToggleFavoriteProduct, onToggleFavoriteStore,
-  locStatus, onRequestLocation,
+  locStatus, onRequestLocation, market,
 }) {
   const [mode, setMode] = useState("products");
   const [favOnly, setFavOnly] = useState(false);
@@ -217,7 +226,7 @@ function SearchView({
       return pool
         .map((l) => ({ l, store: stores.find((s) => s.id === l.storeId) }))
         .filter((r) => r.store)
-        .sort((a, b) => a.store.meters - b.store.meters);
+        .sort((a, b) => byMeters(a.store.meters, b.store.meters));
     }
     return pool
       .map((l) => {
@@ -225,7 +234,7 @@ function SearchView({
         return { l, store, s: store ? score(l, store, tokens) : 0 };
       })
       .filter((r) => r.store && r.s > 0.25)
-      .sort((a, b) => b.s - a.s || a.store.meters - b.store.meters);
+      .sort((a, b) => b.s - a.s || byMeters(a.store.meters, b.store.meters));
   }, [listings, query, mode, stores, favOnly, favorites.products]);
 
   const storeResults = useMemo(() => {
@@ -233,11 +242,11 @@ function SearchView({
     const pool = favOnly ? stores.filter((s) => favorites.stores.includes(s.id)) : stores;
     if (!tokens.length) {
       if (!favOnly) return null;
-      return [...pool].sort((a, b) => a.meters - b.meters);
+      return [...pool].sort((a, b) => byMeters(a.meters, b.meters));
     }
     return pool
       .filter((s) => tokens.every((t) => (s.name + " " + s.kind + " " + s.area).toLowerCase().includes(t)))
-      .sort((a, b) => a.meters - b.meters);
+      .sort((a, b) => byMeters(a.meters, b.meters));
   }, [query, mode, stores, favOnly, favorites.stores]);
 
   const available = results ? results.filter((r) => r.l.status !== "out") : [];
@@ -288,8 +297,27 @@ function SearchView({
           <p className="loc-status loc-status-on">📍 Showing real distances from your location</p>
         ) : (
           <button className="loc-pill" onClick={onRequestLocation} disabled={locStatus === "locating"}>
-            📍 {locStatus === "locating" ? "Locating…" : locStatus === "denied" || locStatus === "unavailable" ? "Distances are estimated · try again" : "Use my location for real distances"}
+            📍 {locStatus === "locating" ? "Locating…" : locStatus === "denied" || locStatus === "unavailable" ? "Couldn't get your location · try again" : "Use my location to see distances"}
           </button>
+        )}
+
+        {market && (
+          <p className="market-status">
+            {market.status === "loading"
+              ? "Loading stores…"
+              : market.status === "offline"
+              ? market.updatedAt
+                ? `No internet. Showing stores from ${new Date(market.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`
+                : "No internet. Connect to see stores near you."
+              : market.status === "error"
+              ? `Couldn't load stores${market.updatedAt ? "; showing the last results" : ""}.`
+              : market.updatedAt
+              ? `Updated ${new Date(market.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`
+              : ""}
+            {market.status !== "loading" && (
+              <button className="link market-refresh" onClick={() => market.refresh({ force: true })}>Refresh</button>
+            )}
+          </p>
         )}
 
         {mode === "products" && !query && suggestions.length > 0 && (
@@ -318,7 +346,7 @@ function SearchView({
                     <button className="storecard" onClick={() => onOpenStore(s.id)}>
                       <span className="storecard-name">{s.name}</span>
                       <span className="storecard-kind">{s.kind}</span>
-                      <span className="storecard-meta">{s.area} · {dist(s.meters)}</span>
+                      <span className="storecard-meta">{s.area}{s.meters != null && ` · ${dist(s.meters)}`}</span>
                     </button>
                     <FavHeart
                       className="storecard-fav"
@@ -336,13 +364,13 @@ function SearchView({
             )
           ) : stores.length > 0 ? (
             <>
-              <p className="results-count">Stores near you</p>
-              {stores.map((s) => (
+              <p className="results-count">{stores.some((s) => s.meters != null) ? "Stores near you" : "Stores"}</p>
+              {[...stores].sort((a, b) => byMeters(a.meters, b.meters)).map((s) => (
                 <div className="storecard-wrap" key={s.id}>
                   <button className="storecard" onClick={() => onOpenStore(s.id)}>
                     <span className="storecard-name">{s.name}</span>
                     <span className="storecard-kind">{s.kind}</span>
-                    <span className="storecard-meta">{s.area} · {dist(s.meters)}</span>
+                    <span className="storecard-meta">{s.area}{s.meters != null && ` · ${dist(s.meters)}`}</span>
                   </button>
                   <FavHeart
                     className="storecard-fav"
@@ -385,7 +413,7 @@ function SearchView({
                     </p>
                     <p className="row-price">{peso(l.price)}</p>
                     <button className="row-store" onClick={() => onOpenStore(store.id)}>{store.name}</button>
-                    <p className="row-meta">{dist(store.meters)} away · <Freshline lastCheckedAt={l.lastCheckedAt} /></p>
+                    <p className="row-meta">{store.meters != null && `${dist(store.meters)} away · `}<Freshline lastCheckedAt={l.lastCheckedAt} /></p>
                   </div>
                 </article>
               ))}
@@ -436,7 +464,7 @@ function StoreView({ store, listings, onBack, favorites, onToggleFavoriteProduct
         <dl className="store-facts">
           <div><dt>Where</dt><dd>{store.area}</dd></div>
           <div><dt>Open</dt><dd>{store.hours}</dd></div>
-          <div><dt>Distance</dt><dd>{dist(store.meters)}</dd></div>
+          {store.meters != null && <div><dt>Distance</dt><dd>{dist(store.meters)}</dd></div>}
           <div><dt>Stock updated</dt><dd><Freshline lastCheckedAt={freshest} /></dd></div>
         </dl>
         <div className="store-actions">
@@ -660,7 +688,7 @@ function SellerView({
   // so pressing "Save profile" can't overwrite them with stale values.
   useEffect(() => {
     setProfileDraft(store);
-  }, [store.name, store.kind, store.area, store.hours, store.phone]);
+  }, [store.name, store.kind, store.area, store.hours, store.phone, store.lat, store.lng]);
   const [profileSaved, setProfileSaved] = useState(false);
   const [pinStep, setPinStep] = useState("idle"); // idle | setting
   const [pinDraft, setPinDraft] = useState("");
@@ -689,7 +717,15 @@ function SellerView({
     setLocateError("");
     navigator.geolocation.getCurrentPosition(
       async (pos) => {
-        const { latitude, longitude } = pos.coords;
+        const { latitude, longitude, accuracy } = pos.coords;
+        // Pin the store here as well as filling in the address. Saved (and
+        // published) only when the owner taps "Save profile".
+        setProfileDraft((p) => ({
+          ...p,
+          lat: latitude,
+          lng: longitude,
+          pinAccuracy: Number.isFinite(accuracy) ? Math.round(accuracy) : null,
+        }));
         try {
           const res = await fetch(
             `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=18&addressdetails=1`
@@ -726,6 +762,9 @@ function SellerView({
       area: profileDraft.area.trim(),
       hours: profileDraft.hours.trim(),
       phone: profileDraft.phone.trim(),
+      lat: Number.isFinite(profileDraft.lat) ? profileDraft.lat : null,
+      lng: Number.isFinite(profileDraft.lng) ? profileDraft.lng : null,
+      pinAccuracy: Number.isFinite(profileDraft.pinAccuracy) ? profileDraft.pinAccuracy : null,
     });
     setProfileSaved(true);
     setTimeout(() => setProfileSaved(false), 2200);
@@ -796,7 +835,10 @@ function SellerView({
       app: "andito",
       backupVersion: BACKUP_VERSION,
       createdAt: new Date().toISOString(),
-      storeProfile: { name: store.name, kind: store.kind, area: store.area, hours: store.hours, phone: store.phone },
+      storeProfile: {
+        name: store.name, kind: store.kind, area: store.area, hours: store.hours, phone: store.phone,
+        lat: store.lat ?? null, lng: store.lng ?? null, pinAccuracy: store.pinAccuracy ?? null,
+      },
       listings: items,
       transactions,
       settings: { lowStockThreshold: settings.lowStockThreshold, language: settings.language },
@@ -1696,6 +1738,27 @@ function SellerView({
                 </div>
                 {locateError && <p className="pin-error">{locateError}</p>}
                 {profileTouched && profileErrors.area && <p className="pin-error">{profileErrors.area}</p>}
+                <p className="pin-note">
+                  {Number.isFinite(profileDraft.lat) && Number.isFinite(profileDraft.lng) ? (
+                    <>
+                      📍 Store pinned on the map{profileDraft.pinAccuracy ? ` (±${profileDraft.pinAccuracy} m)` : ""}.
+                      {profileDraft.pinAccuracy > 100 && " That's rough. Try again outside or near a window."}
+                      {(profileDraft.lat !== store.lat || profileDraft.lng !== store.lng) && " Not saved yet: tap Save profile."}{" "}
+                      <button
+                        type="button"
+                        className="link"
+                        onClick={() => setProfileDraft({ ...profileDraft, lat: null, lng: null, pinAccuracy: null })}
+                      >
+                        Remove pin
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      Not pinned. Tap "Use my location" while you're <strong>at the store</strong>, so shoppers can see how far away it is.
+                      {Number.isFinite(store.lat) && " Tap Save profile to remove the pin."}
+                    </>
+                  )}
+                </p>
               </label>
               <label className="settings-field">
                 <span className="settings-label">Hours *</span>
@@ -2023,7 +2086,8 @@ export default function Andito() {
      immediately on the shopper side without a page reload. */
   const [storeProfile, setStoreProfile] = useState(() => {
     const s = STORES.find((x) => x.id === MY_STORE);
-    return { name: s.name, kind: s.kind, area: s.area, hours: s.hours, phone: s.phone };
+    // lat/lng: the store's map pin, set by the owner while at the store (null = not pinned).
+    return { name: s.name, kind: s.kind, area: s.area, hours: s.hours, phone: s.phone, lat: null, lng: null, pinAccuracy: null };
   });
   const [settings, setSettings] = useState({
     lowStockThreshold: 3,
@@ -2181,16 +2245,6 @@ export default function Andito() {
     );
   };
 
-  const stores = useMemo(
-    () =>
-      STORES.map((s) => {
-        const base = s.id === MY_STORE ? { ...s, ...storeProfile } : s;
-        const meters = userLoc ? Math.round(haversine(userLoc.lat, userLoc.lng, s.lat, s.lng)) : s.fallbackMeters;
-        return { ...base, meters };
-      }),
-    [storeProfile, userLoc]
-  );
-
   const toast = (t) => {
     setMsg(t);
     setTimeout(() => setMsg(null), 2800);
@@ -2240,6 +2294,38 @@ export default function Andito() {
       setSettings((s) => ({ ...s, publishEnabled: false, unpublishPending: true }));
     }
   };
+
+  /* Stores shoppers can browse: this phone's own store, plus every store
+     published to Firebase by other phones. Distance is only shown when both
+     the shopper's location and the store's pin are known, never guessed.
+     (Declared after storeSync, which it reads.) */
+  const market = useMarketplace();
+
+  const stores = useMemo(() => {
+    const distanceTo = (lat, lng) =>
+      userLoc && Number.isFinite(lat) && Number.isFinite(lng)
+        ? Math.round(haversine(userLoc.lat, userLoc.lng, lat, lng))
+        : null;
+    const mine = STORES.map((s) => ({
+      ...s,
+      ...storeProfile,
+      meters: distanceTo(storeProfile.lat, storeProfile.lng),
+    }));
+    // This phone's own published store is already in the list as "mine"
+    // (with fresher data), so its online copy is left out.
+    const ownIds = new Set([market.ownUid, storeSync.state.uid].filter(Boolean));
+    const others = market.stores
+      .filter((s) => !ownIds.has(s.id))
+      .map((s) => ({ ...s, meters: distanceTo(s.lat, s.lng) }));
+    return [...mine, ...others];
+  }, [storeProfile, userLoc, market.stores, market.ownUid, storeSync.state.uid]);
+
+  // Everything the Shop screen can search: this phone's own products plus
+  // every other published store's products.
+  const shopListings = useMemo(() => {
+    const ownIds = new Set([market.ownUid, storeSync.state.uid].filter(Boolean));
+    return [...listings, ...market.listings.filter((l) => !ownIds.has(l.storeId))];
+  }, [listings, market.listings, market.ownUid, storeSync.state.uid]);
 
   /* Notify on restocks for anything the user has favorited — either the
      product itself, or any item at a favorited store. Only fires on view
@@ -2528,6 +2614,9 @@ export default function Andito() {
 .loc-pill:hover:not(:disabled){border-color:var(--accent);color:var(--accent);}
 .loc-pill:disabled{opacity:.6;}
 .loc-status{margin:10px 0 0;font-size:12.5px;font-weight:600;color:var(--accent);}
+.market-status{margin:8px 0 0;font-size:12.5px;color:var(--ink-60);display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;}
+.market-refresh{font-size:12.5px;}
+.pin-note{margin:6px 0 0;font-size:12.5px;color:var(--ink-60);line-height:1.5;}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;}
 .chip{background:var(--card);border:1px solid var(--line);border-radius:100px;padding:7px 14px;font-size:13px;color:var(--ink-60);transition:border-color .15s,color .15s;}
 .chip:hover{border-color:var(--accent);color:var(--accent);}
@@ -2959,7 +3048,8 @@ export default function Andito() {
               {view === "shop" && (
                 <SearchView
                   stores={stores}
-                  listings={listings}
+                  listings={shopListings}
+                  market={market}
                   query={query}
                   setQuery={setQuery}
                   onOpenStore={(id) => { setStoreId(id); setView("store"); }}
@@ -2970,16 +3060,26 @@ export default function Andito() {
                   onRequestLocation={requestUserLocation}
                 />
               )}
-              {view === "store" && (
-                <StoreView
-                  store={stores.find((s) => s.id === storeId)}
-                  listings={listings}
-                  onBack={() => setView("shop")}
-                  favorites={favorites}
-                  onToggleFavoriteProduct={toggleFavoriteProduct}
-                  onToggleFavoriteStore={toggleFavoriteStore}
-                />
-              )}
+              {view === "store" &&
+                (stores.some((s) => s.id === storeId) ? (
+                  <StoreView
+                    store={stores.find((s) => s.id === storeId)}
+                    listings={shopListings}
+                    onBack={() => setView("shop")}
+                    favorites={favorites}
+                    onToggleFavoriteProduct={toggleFavoriteProduct}
+                    onToggleFavoriteStore={toggleFavoriteStore}
+                  />
+                ) : (
+                  // The store was unlisted by its owner since the last refresh.
+                  <>
+                    <button className="back" onClick={() => setView("shop")}>← Back to search</button>
+                    <div className="empty">
+                      <h3>This store is no longer listed.</h3>
+                      <p>Its owner may have taken it offline. Go back to see stores that are listed now.</p>
+                    </div>
+                  </>
+                ))}
               {view === "seller" && settings.pinEnabled && !pinUnlocked ? (
                 <PinGate
                   storeName={storeProfile.name}

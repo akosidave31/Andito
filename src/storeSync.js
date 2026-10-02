@@ -12,7 +12,7 @@
  *   needs-profile  turned on, but the store profile isn't complete yet
  *   offline        no internet; will publish when it comes back
  *   syncing        uploading changes
- *   synced         up to date (at = time of last successful sync)
+ *   synced         up to date (at = time of last successful sync, uid = store id)
  *   error          last upload failed; retries automatically (message)
  *   removing       deleting the store from Firebase
  *   remove-failed  deleting failed; store may still be public (message)
@@ -65,7 +65,8 @@ export function useStoreSync({ enabled, profile, listings }) {
         const res = await pushChanges(uid, profile, listings, remoteRef.current, storeFpRef.current);
         remoteRef.current = res.remote;
         storeFpRef.current = res.storeFingerprint;
-        setState({ status: "synced", at: Date.now() });
+        // uid lets the Shop screen hide this store's online copy from its own owner.
+        setState({ status: "synced", at: Date.now(), uid });
       } catch (e) {
         // Forget what we think is published; the next attempt re-reads it.
         remoteRef.current = null;
