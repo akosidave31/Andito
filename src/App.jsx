@@ -32,20 +32,10 @@ const hoursAgo = (n) => Date.now() - n * 3600000;
    actually added. */
 const LISTINGS = [];
 
-
-/* Fallback content for the seller Dashboard's "Searched near you" panel —
-   ONLY shown there, clearly labeled "Example" (see isLiveDemand in
-   SellerView), and replaced the moment any real search activity exists.
-   Never shown to shoppers as if it were real data. */
-const DEMAND = [
-  { q: "laptop charger", searches: 34, listed: true },
-  { q: "printer ink 664", searches: 21, listed: false },
-  { q: "cctv camera", searches: 17, listed: false },
-  { q: "wireless mouse", searches: 15, listed: true },
-  { q: "laptop battery", searches: 12, listed: false },
-];
-
-const SUGGESTED = ["laptop charger", "cement", "brake pads", "rice", "led bulb"];
+/* The "searched near you" demand signal (shoppers' unmet searches shown on
+   a store's dashboard) was removed until there's a shared backend: without
+   one, a search on a shopper's phone can never reach a store's phone, so
+   the panel could only ever show made-up or same-phone data. */
 const MY_STORE = "s1";
 
 /* ---------------------------- helpers ---------------------------- */
@@ -186,13 +176,33 @@ function FavHeart({ on, onClick, className = "", size = 16 }) {
 }
 
 function SearchView({
-  stores: allStores, listings, query, setQuery, onOpenStore, onRequest,
+  stores: allStores, listings, query, setQuery, onOpenStore,
   favorites, onToggleFavoriteProduct, onToggleFavoriteStore,
   locStatus, onRequestLocation,
 }) {
   const [mode, setMode] = useState("products");
   const [favOnly, setFavOnly] = useState(false);
   const tokens = norm(query);
+
+  /* Suggestion chips come from products that are really listed and in
+     stock at a set-up store, most recently checked first. With nothing
+     listed, no chips show, rather than suggesting things no one sells. */
+  const suggestions = useMemo(() => {
+    const visible = new Set(allStores.filter((s) => s.name.trim() !== "").map((s) => s.id));
+    const seen = new Set();
+    const out = [];
+    [...listings]
+      .filter((l) => visible.has(l.storeId) && l.status !== "out")
+      .sort((a, b) => (b.lastCheckedAt || 0) - (a.lastCheckedAt || 0))
+      .forEach((l) => {
+        const key = l.name.trim().toLowerCase();
+        if (key && !seen.has(key) && out.length < 5) {
+          seen.add(key);
+          out.push(l.name.trim());
+        }
+      });
+    return out;
+  }, [listings, allStores]);
 
   // A store with no name yet hasn't been set up by its owner — shoppers
   // should never see it, whether browsing, searching, or via a listing.
@@ -281,9 +291,9 @@ function SearchView({
           </button>
         )}
 
-        {mode === "products" && !query && (
+        {mode === "products" && !query && suggestions.length > 0 && (
           <div className="chips">
-            {SUGGESTED.map((s) => (
+            {suggestions.map((s) => (
               <button key={s} className="chip" onClick={() => setQuery(s)}>{s}</button>
             ))}
           </div>
@@ -389,8 +399,7 @@ function SearchView({
               ) : (
                 <>
                   <h3>No store here has listed that yet.</h3>
-                  <p>Tell the local stores you're looking for it. They see what people are asking for and can reply when they have stock.</p>
-                  <button className="btn btn-primary" onClick={() => onRequest(query)}>Ask stores for "{query}"</button>
+                  <p>Try a shorter or different word, like the brand or the type of product.</p>
                 </>
               )}
             </div>
@@ -398,7 +407,7 @@ function SearchView({
         ) : (
           <div className="empty">
             <h3>Search for a product.</h3>
-            <p>Type what you're looking for above, or tap one of the suggestions.</p>
+            <p>{suggestions.length > 0 ? "Type what you're looking for above, or tap one of the suggestions." : "Type what you're looking for above."}</p>
           </div>
         )}
       </section>
@@ -638,48 +647,6 @@ function SellerView({
   useBackHandler(!!pendingRestore, () => setPendingRestore(null));
   useBackHandler(!!openProductId, () => setOpenProductId(null));
   const [returnQtys, setReturnQtys] = useState({});
-
-  /* Live demand: shared storage doesn't push updates, so poll it every 15s
-     while the dashboard is open. null = "haven't loaded yet," which the
-     render below treats differently from "loaded but empty." */
-  const [liveDemand, setLiveDemand] = useState(null);
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const res = await window.storage.get("demand-requests", true);
-        const arr = res?.value ? JSON.parse(res.value) : [];
-        if (!cancelled) setLiveDemand(arr);
-      } catch {
-        if (!cancelled) setLiveDemand([]);
-      }
-    };
-    load();
-    const id = setInterval(load, 15000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, []);
-
-  /* Collapse raw shared search events into a ranked list, and check each
-     query against MY_STORE's own items so "not listed" is computed live
-     instead of hand-curated. null (nothing loaded / no requests yet) falls
-     back to the static DEMAND sample so the panel never looks broken on a
-     brand-new deployment with zero real traffic. */
-  const demandDisplay = useMemo(() => {
-    if (!liveDemand || liveDemand.length === 0) return null;
-    const counts = {};
-    liveDemand.forEach(({ query }) => {
-      const key = (query || "").trim().toLowerCase();
-      if (!key) return;
-      counts[key] = (counts[key] || 0) + 1;
-    });
-    return Object.entries(counts)
-      .map(([q, searches]) => ({ q, searches, listed: items.some((l) => score(l, store, norm(q)) > 0.25) }))
-      .sort((a, b) => b.searches - a.searches)
-      .slice(0, 6);
-  }, [liveDemand, items, store]);
-
-  const demandToShow = demandDisplay || DEMAND;
-  const isLiveDemand = !!demandDisplay;
 
   /* ------------------------ Data / Settings tabs ------------------------ */
   const [profileDraft, setProfileDraft] = useState(store);
@@ -1218,8 +1185,6 @@ function SellerView({
             </p>
           </section>
 
-          {/* Two-column: top products + demand */}
-          <div className="cols">
             <section className="panel">
               <div className="panel-head"><h2 className="panel-h">Top products this week</h2></div>
               {topProducts.length > 0 ? (
@@ -1242,28 +1207,6 @@ function SellerView({
                 <p className="panel-foot">{hasItems ? "No sales recorded yet this week." : "Add your first product to start tracking sales."}</p>
               )}
             </section>
-
-            <section className="panel">
-              <div className="panel-head">
-                <h2 className="panel-h">Searched near you</h2>
-                <p className={`panel-note ${isLiveDemand ? "panel-note-live" : ""}`}>{isLiveDemand ? "● Live" : "Example"}</p>
-              </div>
-              <ul className="demand">
-                {demandToShow.map((d) => (
-                  <li key={d.q}>
-                    <span className="demand-q">{d.q}</span>
-                    <span className="demand-n">{d.searches}</span>
-                    <span className={`demand-tag ${d.listed ? "tag-yes" : "tag-no"}`}>{d.listed ? "you list this" : "not listed"}</span>
-                  </li>
-                ))}
-              </ul>
-              <p className="panel-foot">
-                {isLiveDemand
-                  ? "Real searches from shoppers using this app. The ones you don't stock are demand you're turning away."
-                  : "No live searches yet — this is a sample of what shows up once shoppers start asking for things nearby."}
-              </p>
-            </section>
-          </div>
         </>
       )}
 
@@ -2120,30 +2063,6 @@ export default function Andito() {
     prevListingsRef.current = listings;
   }, [listings]);
 
-  /* "Ask stores for X" writes to a SHARED storage bucket (shared: true) so
-     any seller with this same app open sees real demand land on their
-     dashboard within ~15s — not just whoever searched. That's the point of
-     the feature, but it does mean these search terms are visible to anyone
-     who opens this artifact, not just this one account. */
-  const submitDemandRequest = async (q) => {
-    const query = (q || "").trim();
-    if (!query) return;
-    try {
-      let existing = [];
-      try {
-        const res = await window.storage.get("demand-requests", true);
-        existing = res?.value ? JSON.parse(res.value) : [];
-      } catch {
-        existing = [];
-      }
-      const next = [...existing, { query, ts: Date.now() }].slice(-80);
-      await window.storage.set("demand-requests", JSON.stringify(next), true);
-    } catch {
-      // best-effort — the customer still gets a confirmation either way
-    }
-    toast(`Request sent. Stores nearby will see that someone is looking for "${query}".`);
-  };
-
   const resetDemoData = () => {
     setListings(LISTINGS);
     setTransactions([]);
@@ -2830,7 +2749,6 @@ export default function Andito() {
                   query={query}
                   setQuery={setQuery}
                   onOpenStore={(id) => { setStoreId(id); setView("store"); }}
-                  onRequest={submitDemandRequest}
                   favorites={favorites}
                   onToggleFavoriteProduct={toggleFavoriteProduct}
                   onToggleFavoriteStore={toggleFavoriteStore}
