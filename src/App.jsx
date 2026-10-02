@@ -4,6 +4,7 @@ import { App as CapacitorApp } from "@capacitor/app";
 import { Capacitor } from "@capacitor/core";
 import { Filesystem, Directory, Encoding } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
+import { useStoreSync, isProfileComplete } from "./storeSync.js";
 
 /* ------------------------------------------------------------------ *
  * MERON — local store availability + seller dashboard
@@ -618,7 +619,8 @@ function PinGate({ storeName, correctPin, accountPhone, onUnlock, onForgotPin })
 function SellerView({
   listings, setListings, toast, navOpen, setNavOpen,
   page, setPage, cart, setCart, transactions, commitSale, commitReturn,
-  store, onUpdateProfile, settings, setSettings, onResetDemoData, onRestoreBackup, onLockNow, onSignOut,
+  store, onUpdateProfile, settings, setSettings, onResetDemoData, onRestoreBackup,
+  publishState, onSetPublish, onRetryUnpublish, onLockNow, onSignOut,
 }) {
   const items = listings.filter((l) => l.storeId === MY_STORE);
 
@@ -1609,6 +1611,56 @@ function SellerView({
             )}
           </section>
 
+          <section className={`panel ${publishState?.status === "remove-failed" || publishState?.status === "error" ? "panel-alert" : ""}`}>
+            <div className="panel-head"><h2 className="panel-h">List my store publicly</h2></div>
+            <p className="panel-note" style={{ marginBottom: 12 }}>
+              Turning this on publishes your store online. Anyone using Andito can see your store name, category,
+              address, hours and phone number, plus each product's name, brand, details, price, and whether it's in
+              stock. Your supplier costs, exact stock counts and sales stay on this phone.
+            </p>
+            <div className="settings-row">
+              <button
+                className={`switch ${settings.publishEnabled ? "switch-on" : ""}`}
+                onClick={() => onSetPublish(!settings.publishEnabled)}
+                disabled={!settings.publishEnabled && !isProfileComplete(store)}
+                aria-pressed={!!settings.publishEnabled}
+                aria-label="List my store publicly"
+              >
+                <span className="switch-knob" />
+              </button>
+              <span className="settings-row-note">{settings.publishEnabled ? "Listed" : "Not listed"}</span>
+            </div>
+            <p className="panel-note" style={{ marginTop: 10 }}>
+              {(() => {
+                const st = publishState || { status: "off" };
+                switch (st.status) {
+                  case "needs-profile":
+                    return "Fill in and save every store profile field above to publish.";
+                  case "offline":
+                    return "No internet right now. Your store will be published when you're back online.";
+                  case "syncing":
+                    return "Publishing changes…";
+                  case "synced":
+                    return `Published. Up to date as of ${new Date(st.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`;
+                  case "error":
+                    return `Couldn't publish: ${st.message}. Trying again in a minute.`;
+                  case "removing":
+                    return "Removing your store from Andito…";
+                  case "remove-failed":
+                    return `Couldn't remove your store: ${st.message}. It may still be visible to shoppers.`;
+                  default:
+                    if (settings.publishEnabled) return "Starting…";
+                    return isProfileComplete(store)
+                      ? "Not listed. Your store is only on this phone."
+                      : "Fill in and save every store profile field above before listing your store.";
+                }
+              })()}
+            </p>
+            {publishState?.status === "remove-failed" && (
+              <button className="btn btn-ghost btn-sm" onClick={onRetryUnpublish} style={{ marginTop: 8 }}>Try again</button>
+            )}
+          </section>
+
           <section className="panel">
             <div className="panel-head"><h2 className="panel-h">Low-stock alert</h2></div>
             <p className="panel-note" style={{ marginBottom: 12 }}>Flag a product as "low" once it drops to this quantity or below. This is the default — override it for any individual product from the Inventory tab.</p>
@@ -1863,6 +1915,12 @@ export default function Andito() {
     pinEnabled: false,
     pin: "",
     language: "en",
+    // Off until the owner turns it on in Settings: nothing leaves the phone before that.
+    publishEnabled: false,
+    // True from the moment the owner turns publishing off until the store is
+    // confirmed deleted from Firebase, so a failed removal is retried even
+    // after an app restart instead of leaving the store public by accident.
+    unpublishPending: false,
   });
   const [pinUnlocked, setPinUnlocked] = useState(false);
 
@@ -2032,6 +2090,41 @@ export default function Andito() {
     const payload = { account, storeProfile, myListings, transactions, settings, favorites, cart };
     window.storage.set("app-state", JSON.stringify(payload)).catch(() => {});
   }, [loaded, account, storeProfile, listings, transactions, settings, favorites, cart]);
+
+  /* Publishing the owner's store to Firebase (stage 1 of the backend).
+     Only runs once saved data has loaded, for an owner who turned it on. */
+  const myListings = useMemo(() => listings.filter((l) => l.storeId === MY_STORE), [listings]);
+  const storeSync = useStoreSync({
+    enabled: loaded && account?.role === "owner" && !!settings.publishEnabled,
+    profile: storeProfile,
+    listings: myListings,
+  });
+
+  const removeFromMarketplace = () =>
+    storeSync
+      .unpublish()
+      .then(() => {
+        setSettings((s) => ({ ...s, unpublishPending: false }));
+        toast("Your store is no longer listed.");
+      })
+      .catch(() => {
+        // storeSync shows the failure in Settings, with a "Try again" button
+      });
+
+  // Covers both a fresh "turn off" and a removal that failed before the app was closed.
+  useEffect(() => {
+    if (!loaded || !settings.unpublishPending || settings.publishEnabled) return;
+    removeFromMarketplace();
+  }, [loaded, settings.unpublishPending, settings.publishEnabled]);
+
+  const setPublish = (on) => {
+    if (on) {
+      setSettings((s) => ({ ...s, publishEnabled: true, unpublishPending: false }));
+      toast("Publishing your store…");
+    } else {
+      setSettings((s) => ({ ...s, publishEnabled: false, unpublishPending: true }));
+    }
+  };
 
   /* Notify on restocks for anything the user has favorited — either the
      product itself, or any item at a favorited store. Only fires on view
@@ -2604,6 +2697,7 @@ export default function Andito() {
 
 .switch{position:relative;width:42px;height:24px;border-radius:99px;border:0;background:var(--line);padding:0;flex:0 0 auto;transition:background .15s;}
 .switch-on{background:var(--accent);}
+.switch:disabled{opacity:.45;cursor:not-allowed;}
 .switch-knob{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;
   box-shadow:0 1px 2px rgba(42,39,33,.25);transition:transform .15s;}
 .switch-on .switch-knob{transform:translateX(18px);}
@@ -2798,6 +2892,9 @@ export default function Andito() {
                   setSettings={setSettings}
                   onResetDemoData={resetDemoData}
                   onRestoreBackup={restoreBackup}
+                  publishState={storeSync.state}
+                  onSetPublish={setPublish}
+                  onRetryUnpublish={removeFromMarketplace}
                   onLockNow={() => setPinUnlocked(false)}
                   onSignOut={() => { setAccount(null); setPinUnlocked(false); setView("shop"); toast("Signed out."); }}
                 />

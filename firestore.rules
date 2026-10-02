@@ -1,0 +1,50 @@
+rules_version = '2';
+
+// Andito Firestore security rules.
+// These are not deployed automatically: paste this whole file into the
+// Firebase console → Firestore Database → Rules tab → Publish, every time
+// it changes.
+//
+// Anyone can read stores and products (that's the marketplace).
+// Only a store's owner can create, change or delete it, and only with the
+// fields the app is designed to publish.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isOwner(storeId) {
+      return request.auth != null && request.auth.uid == storeId;
+    }
+
+    match /stores/{storeId} {
+      allow read: if true;
+      allow delete: if isOwner(storeId);
+      allow create, update: if isOwner(storeId)
+        && request.resource.data.keys().hasOnly(['ownerUid', 'name', 'kind', 'area', 'hours', 'phone', 'productCount', 'updatedAt'])
+        && request.resource.data.ownerUid == storeId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.kind is string && request.resource.data.kind.size() <= 80
+        && request.resource.data.area is string && request.resource.data.area.size() <= 200
+        && request.resource.data.hours is string && request.resource.data.hours.size() <= 80
+        && request.resource.data.phone is string && request.resource.data.phone.size() <= 30
+        && request.resource.data.productCount is int;
+
+      match /listings/{listingId} {
+        allow read: if true;
+        allow delete: if isOwner(storeId);
+        allow create, update: if isOwner(storeId)
+          && request.resource.data.keys().hasOnly(['name', 'brand', 'specs', 'price', 'status', 'lastCheckedAt', 'updatedAt'])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 120
+          && request.resource.data.brand is string && request.resource.data.brand.size() <= 60
+          && request.resource.data.specs is list && request.resource.data.specs.size() <= 10
+          && request.resource.data.price is number
+          && request.resource.data.price >= 0
+          && request.resource.data.status in ['in', 'low', 'out'];
+      }
+    }
+  }
+}
