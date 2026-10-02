@@ -648,6 +648,10 @@ function SellerView({
   const [pendingRestore, setPendingRestore] = useState(null); // { data, fileName } | null
   useBackHandler(!!pendingRestore, () => setPendingRestore(null));
   useBackHandler(!!openProductId, () => setOpenProductId(null));
+
+  // Editing a product's name and price from its detail screen.
+  const [detailEdit, setDetailEdit] = useState(null); // { id, name, price } | null
+  useBackHandler(!!detailEdit, () => setDetailEdit(null));
   const [returnQtys, setReturnQtys] = useState({});
 
   /* ------------------------ Data / Settings tabs ------------------------ */
@@ -975,6 +979,27 @@ function SellerView({
       toast(`${l.name} on-hand corrected to ${newQty}.`);
     }
     setEditingQtyId(null);
+  };
+
+  /* Saves a corrected name or price. Past sales keep the price they were
+     actually sold at (each sale records its own price), so this only
+     affects sales from now on. */
+  const saveDetailEdit = () => {
+    if (!detailEdit) return;
+    const name = detailEdit.name.trim();
+    const rawPrice = String(detailEdit.price).trim();
+    const price = Number(rawPrice);
+    if (!name) {
+      toast("Product name can't be empty.");
+      return;
+    }
+    if (rawPrice === "" || !Number.isFinite(price) || price < 0) {
+      toast("Enter a valid price, like 15 or 12.50.");
+      return;
+    }
+    patch(detailEdit.id, (x) => ({ ...x, name, price }));
+    setDetailEdit(null);
+    toast(`${name} updated.`);
   };
 
   const setLowAt = (id, raw) => {
@@ -1366,17 +1391,54 @@ function SellerView({
 
             if (openItem) {
               const l = openItem;
+              const editingThis = !!detailEdit && detailEdit.id === l.id;
               return (
                 <section className="panel">
-                  <button className="back back-inline" onClick={() => setOpenProductId(null)}>← All products</button>
+                  <button className="back back-inline" onClick={() => { setDetailEdit(null); setOpenProductId(null); }}>← All products</button>
                   <div className="product-detail">
-                    <h2 className="product-detail-name">{l.name}</h2>
+                    {editingThis ? (
+                      <div className="addbox">
+                        <label className="settings-field">
+                          <span className="settings-label">Product name</span>
+                          <input
+                            className="field"
+                            value={detailEdit.name}
+                            onChange={(e) => setDetailEdit({ ...detailEdit, name: e.target.value })}
+                          />
+                        </label>
+                        <label className="settings-field">
+                          <span className="settings-label">Price (₱)</span>
+                          <input
+                            className="field"
+                            inputMode="decimal"
+                            value={detailEdit.price}
+                            onChange={(e) => setDetailEdit({ ...detailEdit, price: e.target.value.replace(/[^0-9.]/g, "") })}
+                          />
+                        </label>
+                        <div className="addrow">
+                          <button className="btn btn-primary" onClick={saveDetailEdit}>Save</button>
+                          <button className="btn btn-ghost" onClick={() => setDetailEdit(null)}>Cancel</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="product-detail-head">
+                        <h2 className="product-detail-name">{l.name}</h2>
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => setDetailEdit({ id: l.id, name: l.name, price: String(l.price) })}
+                        >
+                          Edit
+                        </button>
+                      </div>
+                    )}
                     <p className="product-detail-fresh"><Freshline lastCheckedAt={l.lastCheckedAt} /></p>
 
-                    <div className="product-detail-row">
-                      <span className="inv-k">Price</span>
-                      <span className="product-detail-value">{peso(l.price)}</span>
-                    </div>
+                    {!editingThis && (
+                      <div className="product-detail-row">
+                        <span className="inv-k">Price</span>
+                        <span className="product-detail-value">{peso(l.price)}</span>
+                      </div>
+                    )}
 
                     <div className="product-detail-row">
                       <span className="inv-k">On hand</span>
@@ -2629,6 +2691,7 @@ export default function Andito() {
 
 .product-detail{display:flex;flex-direction:column;gap:20px;}
 .product-detail-name{font-family:'Inter',sans-serif;font-weight:700;font-size:24px;margin:0;letter-spacing:-.01em;}
+.product-detail-head{display:flex;align-items:center;justify-content:space-between;gap:12px;}
 .product-detail-fresh{margin:-10px 0 0;font-size:13.5px;}
 .product-detail-row{display:flex;flex-direction:column;gap:5px;}
 .product-detail-value{font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:600;}
