@@ -633,7 +633,7 @@ function SellerView({
   const [qtyDraft, setQtyDraft] = useState("");
   const [pickedDay, setPickedDay] = useState(null);
   const [adding, setAdding] = useState(false);
-  const [draft, setDraft] = useState({ name: "", price: "", qty: "", cost: "" });
+  const [draft, setDraft] = useState({ name: "", brand: "", price: "", qty: "", cost: "" });
 
   const [posName, setPosName] = useState("");
   const [posPickId, setPosPickId] = useState(null);
@@ -997,9 +997,23 @@ function SellerView({
       toast("Enter a valid price, like 15 or 12.50.");
       return;
     }
-    patch(detailEdit.id, (x) => ({ ...x, name, price }));
+    // "—" is how the app stores "no brand"; shoppers see no brand at all.
+    const brand = String(detailEdit.brand || "").trim() || "—";
+    patch(detailEdit.id, (x) => ({ ...x, name, brand, price }));
     setDetailEdit(null);
     toast(`${name} updated.`);
+  };
+
+  /* Removes a product from inventory (and from the public listing, if the
+     store is published). Past sales of it stay in the sales history: each
+     sale keeps its own copy of the name and price. It's also taken out of
+     an unfinished POS cart so it can't be sold after being deleted. */
+  const deleteProduct = (l) => {
+    setListings((prev) => prev.filter((x) => x.id !== l.id));
+    setCart((prev) => prev.filter((c) => c.id !== l.id));
+    setDetailEdit(null);
+    setOpenProductId(null);
+    toast(`${l.name} deleted.`);
   };
 
   const setLowAt = (id, raw) => {
@@ -1014,12 +1028,12 @@ function SellerView({
     const costEntered = draft.cost.trim() !== "";
     const cost = costEntered ? Math.max(0, Number(draft.cost) || 0) : Math.round(price * 0.7);
     setListings((prev) => [
-      { id: "n" + Date.now(), storeId: MY_STORE, name: draft.name.trim(), brand: "—", specs: [], price, cost, costEstimated: !costEntered, qty, status: statusFromQty(qty, settings.lowStockThreshold), lastCheckedAt: Date.now() },
+      { id: "n" + Date.now(), storeId: MY_STORE, name: draft.name.trim(), brand: draft.brand.trim() || "—", specs: [], price, cost, costEstimated: !costEntered, qty, status: statusFromQty(qty, settings.lowStockThreshold), lastCheckedAt: Date.now() },
       ...prev,
     ]);
-    setDraft({ name: "", price: "", qty: "", cost: "" });
+    setDraft({ name: "", brand: "", price: "", qty: "", cost: "" });
     setAdding(false);
-    toast(costEntered ? "Product added and now visible to shoppers." : "Product added. Cost wasn't entered, so margin for this item is a rough estimate — add the real cost anytime in Inventory.");
+    toast(costEntered ? "Product added." : "Product added. Cost wasn't entered, so margin for this item is a rough estimate. Add the real cost anytime in Inventory.");
   };
 
   /* Lets a seller fill in (or correct) a product's real supplier cost after
@@ -1407,6 +1421,14 @@ function SellerView({
                           />
                         </label>
                         <label className="settings-field">
+                          <span className="settings-label">Brand (optional)</span>
+                          <input
+                            className="field"
+                            value={detailEdit.brand}
+                            onChange={(e) => setDetailEdit({ ...detailEdit, brand: e.target.value })}
+                          />
+                        </label>
+                        <label className="settings-field">
                           <span className="settings-label">Price (₱)</span>
                           <input
                             className="field"
@@ -1419,13 +1441,43 @@ function SellerView({
                           <button className="btn btn-primary" onClick={saveDetailEdit}>Save</button>
                           <button className="btn btn-ghost" onClick={() => setDetailEdit(null)}>Cancel</button>
                         </div>
+
+                        <div className="delete-zone">
+                          {!detailEdit.confirmDelete ? (
+                            <button className="link link-danger" onClick={() => setDetailEdit({ ...detailEdit, confirmDelete: true })}>
+                              Delete product
+                            </button>
+                          ) : (
+                            <>
+                              <p className="panel-note">
+                                Delete <strong>{l.name}</strong>? It will be removed from your inventory
+                                {settings.publishEnabled ? " and from your public listing" : ""}. Past sales of it stay in your sales history. This can't be undone.
+                              </p>
+                              <div className="addrow">
+                                <button className="btn btn-sm btn-danger" onClick={() => deleteProduct(l)}>Yes, delete</button>
+                                <button className="btn btn-ghost btn-sm" onClick={() => setDetailEdit({ ...detailEdit, confirmDelete: false })}>Keep it</button>
+                              </div>
+                            </>
+                          )}
+                        </div>
                       </div>
                     ) : (
                       <div className="product-detail-head">
-                        <h2 className="product-detail-name">{l.name}</h2>
+                        <div>
+                          <h2 className="product-detail-name">{l.name}</h2>
+                          {l.brand && l.brand !== "—" && <p className="product-detail-brand">{l.brand}</p>}
+                        </div>
                         <button
                           className="btn btn-ghost btn-sm"
-                          onClick={() => setDetailEdit({ id: l.id, name: l.name, price: String(l.price) })}
+                          onClick={() =>
+                            setDetailEdit({
+                              id: l.id,
+                              name: l.name,
+                              brand: l.brand && l.brand !== "—" ? l.brand : "",
+                              price: String(l.price),
+                              confirmDelete: false,
+                            })
+                          }
                         >
                           Edit
                         </button>
@@ -1555,6 +1607,7 @@ function SellerView({
                   {adding && (
                     <div className="addbox">
                       <input className="field" placeholder="Product name" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
+                      <input className="field" placeholder="Brand (optional)" value={draft.brand} onChange={(e) => setDraft({ ...draft, brand: e.target.value })} />
                       <div className="addrow">
                         <input className="field" placeholder="Price" inputMode="numeric" value={draft.price} onChange={(e) => setDraft({ ...draft, price: e.target.value })} />
                         <input className="field" placeholder="On hand" inputMode="numeric" value={draft.qty} onChange={(e) => setDraft({ ...draft, qty: e.target.value })} />
@@ -2692,6 +2745,10 @@ export default function Andito() {
 .product-detail{display:flex;flex-direction:column;gap:20px;}
 .product-detail-name{font-family:'Inter',sans-serif;font-weight:700;font-size:24px;margin:0;letter-spacing:-.01em;}
 .product-detail-head{display:flex;align-items:center;justify-content:space-between;gap:12px;}
+.product-detail-brand{margin:4px 0 0;font-size:13.5px;font-weight:600;color:var(--ink-60);}
+.delete-zone{margin-top:6px;padding-top:12px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:10px;align-items:flex-start;}
+.link-danger{color:var(--out);}
+.btn.btn-danger{background:var(--out);border-color:var(--out);color:#fff;}
 .product-detail-fresh{margin:-10px 0 0;font-size:13.5px;}
 .product-detail-row{display:flex;flex-direction:column;gap:5px;}
 .product-detail-value{font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:600;}
