@@ -57,6 +57,27 @@ jobs:
         continue-on-error: true
         run: npx --yes @capacitor/assets@3 generate --android
 
+      # Android only installs an update over an existing app if both are
+      # signed with the same key. Without this step, every GitHub build
+      # makes a brand-new random debug key, so phones refuse to update and
+      # the app has to be uninstalled first, which wipes all store data.
+      # Gradle signs debug builds with ~/.android/debug.keystore, so we put
+      # the permanent key there. The key itself lives only in the
+      # ANDROID_DEBUG_KEYSTORE_B64 repository secret (and Dave's private
+      # copy), never in the repo.
+      - name: Use the permanent signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::The ANDROID_DEBUG_KEYSTORE_B64 secret is missing. Refusing to build with a random key, because phones couldn't update to it without uninstalling (which wipes store data)."
+            exit 1
+          fi
+          mkdir -p ~/.android
+          echo "$KEYSTORE_B64" | base64 --decode > ~/.android/debug.keystore
+          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey > /dev/null \
+            || { echo "::error::The signing key in ANDROID_DEBUG_KEYSTORE_B64 couldn't be read. Re-create it with the exact keytool command from the setup steps."; exit 1; }
+
       - name: Build debug APK
         working-directory: android
         run: |
