@@ -82,7 +82,28 @@ jobs:
         working-directory: android
         run: |
           chmod +x gradlew
+          # Point the Android build tools at the folder holding the permanent
+          # key explicitly, instead of trusting their default search order.
+          export ANDROID_USER_HOME="$HOME/.android"
           ./gradlew assembleDebug
+
+      # Proof, not trust: compare the finished APK's signature with the
+      # permanent key's fingerprint. If they differ, phones couldn't update
+      # to this APK, so the build fails here instead of producing it.
+      - name: Check the APK is signed with the permanent key
+        run: |
+          EXPECTED=$(keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey \
+            | grep -m1 'SHA256:' | awk '{print $2}' | tr -d ':' | tr 'A-F' 'a-f')
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
+          ACTUAL=$("${BUILD_TOOLS}apksigner" verify --print-certs android/app/build/outputs/apk/debug/app-debug.apk \
+            | grep -m1 'certificate SHA-256 digest' | awk '{print $NF}')
+          echo "Permanent key: $EXPECTED"
+          echo "APK signed by: $ACTUAL"
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::The APK is NOT signed with the permanent key. Phones would refuse it as an update."
+            exit 1
+          fi
+          echo "OK: APK is signed with the permanent key."
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
