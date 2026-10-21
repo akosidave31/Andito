@@ -85,15 +85,25 @@ export function publicStoreDoc(uid, profile, productCount) {
 }
 
 /* The public shape of a product. Cost and exact quantity are deliberately
-   left out; shoppers only see whether it's in stock, low, or out. */
+   left out; shoppers only see whether it's in stock, low, or out.
+
+   lastCheckedAt is published rounded down to 10 minutes. Every sale marks
+   a product as checked, and the exact time would make each sale rewrite the
+   product online. Rounded, a product is rewritten at most once per 10
+   minutes for this (status and price changes still go out right away),
+   which keeps a busy store far inside Firebase's free daily writes.
+   Shoppers see freshness in hours ("checked 2h ago"), so nothing visible
+   changes. */
+const CHECKED_STEP_MS = 10 * 60 * 1000;
 export function publicListingDoc(l) {
+  const checked = Number(l.lastCheckedAt) || 0;
   return {
     name: clip(l.name, 120) || "Unnamed product",
     brand: l.brand && l.brand !== "—" ? clip(l.brand, 60) : "",
     specs: Array.isArray(l.specs) ? l.specs.slice(0, 10).map((s) => clip(s, 60)) : [],
     price: Math.max(0, Number(l.price) || 0),
     status: ["in", "low", "out"].includes(l.status) ? l.status : "in",
-    lastCheckedAt: Math.round(Number(l.lastCheckedAt) || 0),
+    lastCheckedAt: checked > 0 ? Math.floor(checked / CHECKED_STEP_MS) * CHECKED_STEP_MS : 0,
   };
 }
 

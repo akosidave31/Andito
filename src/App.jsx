@@ -8,10 +8,20 @@ import { useStoreSync, isProfileComplete } from "./storeSync.js";
 import { useMarketplace } from "./marketplace.js";
 
 /* ------------------------------------------------------------------ *
- * MERON — local store availability + seller dashboard
- * Prototype. State is in memory but shaped like the intended
- * Firestore collections: stores / listings / sales.
+ * ANDITO — local store availability + seller dashboard
+ * The owner's products, sales and settings are saved on this phone (see
+ * storagePolyfill.js). A store whose owner turns on "List my store
+ * publicly" is published to Firebase (storeSync.js), and the Shop screen
+ * loads every published store from there (marketplace.js).
  * ------------------------------------------------------------------ */
+
+/* Which build this is, shown in Settings so it's easy to check that a new
+   APK really got installed. vite.config.js fills it in from GitHub Actions;
+   a build made anywhere else shows as "Local build". */
+const BUILD = typeof __ANDITO_BUILD__ === "object" && __ANDITO_BUILD__ ? __ANDITO_BUILD__ : {};
+const BUILD_LABEL = BUILD.run
+  ? `Build ${BUILD.run}${BUILD.commit ? ` · ${BUILD.commit}` : ""}${BUILD.date ? ` · ${BUILD.date}` : ""}`
+  : "Local build";
 
 /* Only MY_STORE's slot exists — a fresh install has no fictional competitor
    stores and no fictional products. name/kind/area/hours/phone start blank
@@ -23,12 +33,6 @@ import { useMarketplace } from "./marketplace.js";
 const STORES = [
   { id: "s1", name: "", kind: "", area: "", hours: "", phone: "" },
 ];
-
-/* Seed listings are written as "checked N hours ago" for readability, then
-   converted once at load into a real timestamp (lastCheckedAt) so freshness
-   keeps advancing in real time and still makes sense after a reload —
-   a static "age" number would otherwise look frozen forever once persisted. */
-const hoursAgo = (n) => Date.now() - n * 3600000;
 
 /* No seed products. Everything in Inventory is something a real owner
    actually added. */
@@ -65,6 +69,35 @@ function useBackHandler(active, handler) {
   }, [active]);
 }
 
+/* Runs onHide when Andito goes to the background and onShow when it comes
+   back. Listens to the web page's visibility event and to Capacitor's own
+   pause/resume, whichever fires; both handlers are safe to run twice. */
+function useAppLifecycle(onHide, onShow) {
+  const ref = useRef({ onHide, onShow });
+  ref.current = { onHide, onShow };
+  useEffect(() => {
+    const onVisibility = () =>
+      document.visibilityState === "hidden" ? ref.current.onHide() : ref.current.onShow();
+    const onPageHide = () => ref.current.onHide();
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", onPageHide);
+    let cancelled = false;
+    const handles = [];
+    const listen = (event, fn) =>
+      CapacitorApp.addListener(event, fn)
+        .then((h) => (cancelled ? h.remove() : handles.push(h)))
+        .catch(() => {});
+    listen("pause", () => ref.current.onHide());
+    listen("resume", () => ref.current.onShow());
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", onPageHide);
+      handles.forEach((h) => h.remove());
+    };
+  }, []);
+}
+
 /* Start of the local calendar day containing t (ms). Sales are bucketed by
    the day they actually happened, using the phone's own clock/timezone. */
 const startOfDay = (t) => {
@@ -91,7 +124,18 @@ const checkBackup = (data) => {
 
 const DAY_MS = 86400000;
 
-const peso = (n) => "\u20B1" + Math.round(n).toLocaleString("en-PH");
+// Whole pesos show without centavos (15); prices with centavos keep them (12.50), instead
+// of being rounded to a price the store doesn't actually charge.
+const peso = (n) => {
+  const v = Number(n) || 0;
+  const whole = Math.abs(v - Math.round(v)) < 0.005;
+  return (
+    "\u20B1" +
+    (whole
+      ? Math.round(v).toLocaleString("en-PH")
+      : v.toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))
+  );
+};
 const pesoShort = (n) => (n >= 1000 ? "\u20B1" + (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : "\u20B1" + n);
 
 const freshness = (lastCheckedAt) => {
@@ -103,9 +147,8 @@ const freshness = (lastCheckedAt) => {
   return { key: "stale", label: `not checked in ${days}d` };
 };
 
-/* Great-circle distance in meters. Used to turn the user's real coordinates
-   (if they grant location) into an actual "X meters away" instead of the
-   fixed demo distance every store ships with. */
+/* Great-circle distance in meters, between the shopper's location (if they
+   share it) and a store's map pin (if its owner set one). */
 const haversine = (lat1, lng1, lat2, lng2) => {
   const R = 6371000;
   const p1 = (lat1 * Math.PI) / 180;
@@ -132,15 +175,32 @@ const byMeters = (a, b) => {
   if (b == null) return -1;
   return a - b;
 };
-const norm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+// Lowercase without accents, so "pina" finds "Piña" and "nino" finds "Niño".
+const fold = (s) => String(s ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+// Search words. Numbers and units are split apart, so "1kg" matches "1 kg"
+// and "500ml" matches "500 mL".
+const norm = (s) =>
+  fold(s)
+    .replace(/(\d)([a-z])/g, "$1 $2")
+    .replace(/([a-z])(\d)/g, "$1 $2")
+    .replace(/[^a-z0-9 ]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
 
 function score(listing, store, tokens) {
   if (!tokens.length) return 0;
-  const hay = norm([listing.name, listing.brand, listing.specs.join(" "), store.name, store.kind].join(" "));
+  const hay = norm([listing.name, listing.brand, (listing.specs || []).join(" "), store.name, store.kind].join(" "));
+  // A one-character word ("c" from "C2", "1" from "1L") must match exactly,
+  // or "c2" would find every product with a word starting with c. The one
+  // exception is a single character typed on its own, as the start of a word.
+  const loose = tokens.length === 1;
   let hits = 0;
   for (const t of tokens) {
     if (hay.some((w) => w === t)) hits += 2;
-    else if (hay.some((w) => w.startsWith(t) || t.startsWith(w))) hits += 1;
+    // Partial matches: "sardine" finds "sardines" and "noodles" finds
+    // "noodle". The second direction needs a word of 3+ letters; otherwise a
+    // lone "l" (from "1 L") would match every search that starts with l.
+    else if (hay.some((w) => ((t.length >= 2 || loose) && w.startsWith(t)) || (w.length >= 3 && t.startsWith(w)))) hits += 1;
   }
   if (hits === 0) return 0;
   let s = hits / (tokens.length * 2);
@@ -152,7 +212,167 @@ function score(listing, store, tokens) {
   return s;
 }
 
+/* A phone number for tel: and sms: links: digits and a leading +, nothing else. */
+const dialable = (phone) => String(phone || "").replace(/[^\d+]/g, "");
+
+/* Google Maps directions to the store's pin, or a search for its name and
+   address if the owner hasn't pinned it. Opens the Maps app when installed. */
+const mapsUrl = (store) =>
+  Number.isFinite(store.lat) && Number.isFinite(store.lng)
+    ? `https://www.google.com/maps/dir/?api=1&destination=${store.lat},${store.lng}`
+    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([store.name, store.area].filter(Boolean).join(", "))}`;
+
+/* When a sale happened: "Today 02:15 PM", "Yesterday 09:02 AM" or "Oct 18 · 04:40 PM". */
+const saleWhen = (time) => {
+  const d = time instanceof Date ? time : new Date(time);
+  if (Number.isNaN(d.getTime())) return "";
+  const clock = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const day = startOfDay(d.getTime());
+  const today = startOfDay(Date.now());
+  if (day === today) return `Today ${clock}`;
+  if (day === startOfDay(today - 1)) return `Yesterday ${clock}`;
+  return `${d.toLocaleDateString([], { month: "short", day: "numeric" })} · ${clock}`;
+};
+
+/* ------------------------------ location ------------------------------ *
+ * GPS from a cold start often needs 20-30 seconds, and doesn't work indoors
+ * or under a steel roof at all. The network fix (Wi-Fi and cell towers) is
+ * quick but rough. So every request tries one and then the other: pinning
+ * a store tries GPS first (precision matters), a shopper's "near me" tries
+ * the network first (speed matters). Resolves with a GeolocationPosition,
+ * or rejects with the last GeolocationPositionError.
+ */
+const GPS_FIX = { enableHighAccuracy: true, timeout: 25000, maximumAge: 0 };
+const NETWORK_FIX = { enableHighAccuracy: false, timeout: 15000, maximumAge: 2 * 60000 };
+
+const positionOnce = (options) =>
+  new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, options));
+
+async function locate({ precise }) {
+  let lastError = null;
+  for (const options of precise ? [GPS_FIX, NETWORK_FIX] : [NETWORK_FIX, GPS_FIX]) {
+    try {
+      return await positionOnce(options);
+    } catch (e) {
+      lastError = e;
+      if (e && e.code === 1) break; // permission denied: asking again won't change that
+    }
+  }
+  throw lastError;
+}
+
+// What went wrong, in words the owner or shopper can act on.
+const locateErrorMessage = (err) =>
+  err && err.code === 1
+    ? "Andito isn't allowed to use your location. Allow it in Android Settings > Apps > Andito > Permissions > Location, then try again."
+    : err && err.code === 3
+    ? "No GPS signal yet. Go outside or near a window, wait a moment, then try again."
+    : "Couldn't find your location. Check that Location is turned on in your phone's quick settings, then try again.";
+
+/* Street address for a map point, from OpenStreetMap. Returns "" when it
+   can't be looked up within 8 seconds (no internet, at sea, service busy). */
+async function reverseGeocode(lat, lng) {
+  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = setTimeout(() => ctrl && ctrl.abort(), 8000);
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`,
+      ctrl ? { signal: ctrl.signal } : undefined
+    );
+    if (!res.ok) return "";
+    const data = await res.json();
+    return typeof data?.display_name === "string" ? data.display_name.slice(0, 200) : "";
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ----------------------------- saved data ----------------------------- */
+
+const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+
+/* Cleans up a saved or restored sales log, so one damaged entry can't break
+   the dashboard or POS: entries that aren't sales are dropped, and missing
+   numbers become 0. */
+const cleanTransactions = (list) =>
+  (Array.isArray(list) ? list : [])
+    .filter((t) => isObj(t) && Array.isArray(t.lines))
+    .map((t, i) => {
+      const lines = t.lines.filter(isObj).map((l) => ({
+        ...l,
+        id: String(l.id ?? ""),
+        name: String(l.name ?? ""),
+        price: Number(l.price) || 0,
+        qty: Number(l.qty) || 0,
+        returnedQty: Number(l.returnedQty) || 0,
+      }));
+      const total = Number(t.total);
+      return {
+        ...t,
+        id: t.id != null ? String(t.id) : `t-restored-${i}`,
+        time: new Date(t.time),
+        lines,
+        total: Number.isFinite(total) ? total : lines.reduce((a, l) => a + l.qty * l.price, 0),
+      };
+    });
+
+/* Reads the state this phone saved last time. Throws if it can't be read. */
+const parseSavedState = (raw) => {
+  const s = JSON.parse(raw);
+  if (!isObj(s)) throw new Error("Saved data isn't in the expected format.");
+  return {
+    account: isObj(s.account) ? s.account : null,
+    storeProfile: isObj(s.storeProfile) ? s.storeProfile : null,
+    myListings: Array.isArray(s.myListings) ? s.myListings.filter(isObj) : null,
+    transactions: Array.isArray(s.transactions) ? cleanTransactions(s.transactions) : null,
+    settings: isObj(s.settings) ? s.settings : null,
+    favorites: isObj(s.favorites)
+      ? {
+          products: Array.isArray(s.favorites.products) ? s.favorites.products : [],
+          stores: Array.isArray(s.favorites.stores) ? s.favorites.stores : [],
+        }
+      : null,
+    cart: Array.isArray(s.cart) ? s.cart.filter(isObj) : null,
+  };
+};
+
 /* ---------------------------- shared pieces ---------------------------- */
+
+/* Typed money amount, cleaned up: digits, at most one decimal point, and at
+   most two decimals ("12..50" becomes "12.50", "₱15" becomes "15"). */
+const decimalText = (v) => {
+  const t = String(v ?? "").replace(/[^0-9.]/g, "");
+  const dot = t.indexOf(".");
+  return dot < 0 ? t : t.slice(0, dot + 1) + t.slice(dot + 1).replace(/\./g, "").slice(0, 2);
+};
+
+/* A money field the owner can type into freely ("12.", "0.5"). While it
+   has focus it keeps the owner's own text; otherwise it shows the saved
+   value. */
+function DecimalInput({ value, onValue, ...rest }) {
+  const [text, setText] = useState(value == null ? "" : String(value));
+  const [focused, setFocused] = useState(false);
+  useEffect(() => {
+    if (!focused) setText(value == null ? "" : String(value));
+  }, [value, focused]);
+  return (
+    <input
+      {...rest}
+      type="text"
+      inputMode="decimal"
+      value={text}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+      onChange={(e) => {
+        const t = decimalText(e.target.value);
+        setText(t);
+        onValue(t);
+      }}
+    />
+  );
+}
 
 function Stamp({ status, lastCheckedAt }) {
   const f = freshness(lastCheckedAt);
@@ -245,7 +465,10 @@ function SearchView({
       return [...pool].sort((a, b) => byMeters(a.meters, b.meters));
     }
     return pool
-      .filter((s) => tokens.every((t) => (s.name + " " + s.kind + " " + s.area).toLowerCase().includes(t)))
+      .filter((s) => {
+        const hay = norm(`${s.name} ${s.kind} ${s.area}`).join(" ");
+        return tokens.every((t) => hay.includes(t));
+      })
       .sort((a, b) => byMeters(a.meters, b.meters));
   }, [query, mode, stores, favOnly, favorites.stores]);
 
@@ -294,7 +517,10 @@ function SearchView({
         </div>
 
         {locStatus === "granted" ? (
-          <p className="loc-status loc-status-on">📍 Showing real distances from your location</p>
+          <p className="loc-status loc-status-on">
+            📍 Showing real distances from your location{" "}
+            <button className="link loc-update" onClick={onRequestLocation}>Update</button>
+          </p>
         ) : (
           <button className="loc-pill" onClick={onRequestLocation} disabled={locStatus === "locating"}>
             📍 {locStatus === "locating" ? "Locating…" : locStatus === "denied" || locStatus === "unavailable" ? "Couldn't get your location · try again" : "Use my location to see distances"}
@@ -449,8 +675,11 @@ function StoreView({ store, listings, onBack, favorites, onToggleFavoriteProduct
   const [q, setQ] = useState("");
   const tokens = norm(q);
   const shown = tokens.length ? items.filter((l) => score(l, store, tokens) > 0.25) : items;
-  const freshest = items.length ? Math.max(...items.map((i) => i.lastCheckedAt)) : null;
+  // Most recent stock check. Products never checked (no time) don't count,
+  // so they can't make the whole store look decades out of date.
+  const freshest = items.reduce((m, i) => (Number.isFinite(i.lastCheckedAt) && i.lastCheckedAt > m ? i.lastCheckedAt : m), 0) || null;
   const storeFav = favorites.stores.includes(store.id);
+  const phone = dialable(store.phone);
 
   return (
     <>
@@ -464,12 +693,16 @@ function StoreView({ store, listings, onBack, favorites, onToggleFavoriteProduct
         <dl className="store-facts">
           <div><dt>Where</dt><dd>{store.area}</dd></div>
           <div><dt>Open</dt><dd>{store.hours}</dd></div>
+          {store.phone && <div><dt>Phone</dt><dd>{store.phone}</dd></div>}
           {store.meters != null && <div><dt>Distance</dt><dd>{dist(store.meters)}</dd></div>}
           <div><dt>Stock updated</dt><dd><Freshline lastCheckedAt={freshest} /></dd></div>
         </dl>
+        {/* Real links: Android opens the phone's dialer, its SMS app, or
+            Google Maps for these. */}
         <div className="store-actions">
-          <button className="btn btn-primary">Message {store.phone}</button>
-          <button className="btn btn-ghost">Get directions</button>
+          {phone && <a className="btn btn-primary" href={`tel:${phone}`}>Call</a>}
+          {phone && <a className="btn btn-ghost" href={`sms:${phone}`}>Text</a>}
+          <a className="btn btn-ghost" href={mapsUrl(store)} target="_blank" rel="noopener noreferrer">Directions</a>
         </div>
       </header>
 
@@ -667,6 +900,9 @@ function SellerView({
   const [posPickId, setPosPickId] = useState(null);
   const [posQty, setPosQty] = useState("1");
   const [openReturnTx, setOpenReturnTx] = useState(null);
+  // "Recent sales" shows this many at first, so a long sales history
+  // doesn't make the POS screen slow to open.
+  const [salesShown, setSalesShown] = useState(20);
 
   useBackHandler(adding, () => setAdding(false));
 
@@ -708,46 +944,38 @@ function SellerView({
   };
   const profileComplete = Object.values(profileErrors).every((e) => !e);
 
-  const useMyLocation = () => {
+  /* Pins the store where the phone is now. GPS first, then the network fix
+     (see locate). The pin is saved (and published) only when the owner
+     taps "Save profile". An address the owner already typed is kept; the
+     address is looked up only when that field is empty. */
+  const pinStoreLocation = async () => {
     if (!navigator.geolocation) {
-      setLocateError("Location isn't available on this device or browser — type your address instead.");
+      setLocateError("This phone can't share its location with Andito. Type your address instead.");
       return;
     }
     setLocating(true);
     setLocateError("");
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const { latitude, longitude, accuracy } = pos.coords;
-        // Pin the store here as well as filling in the address. Saved (and
-        // published) only when the owner taps "Save profile".
-        setProfileDraft((p) => ({
-          ...p,
-          lat: latitude,
-          lng: longitude,
-          pinAccuracy: Number.isFinite(accuracy) ? Math.round(accuracy) : null,
-        }));
-        try {
-          const res = await fetch(
-            `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=18&addressdetails=1`
-          );
-          const data = await res.json();
-          setProfileDraft((p) => ({ ...p, area: data?.display_name || `${latitude.toFixed(5)}, ${longitude.toFixed(5)}` }));
-        } catch {
-          setProfileDraft((p) => ({ ...p, area: `${latitude.toFixed(5)}, ${longitude.toFixed(5)}` }));
-        } finally {
-          setLocating(false);
-        }
-      },
-      (err) => {
-        setLocating(false);
-        setLocateError(
-          err.code === 1
-            ? "Location permission denied — type your address instead."
-            : "Couldn't get your location — type your address instead."
-        );
-      },
-      { enableHighAccuracy: true, timeout: 10000 }
-    );
+    let pos;
+    try {
+      pos = await locate({ precise: true });
+    } catch (err) {
+      setLocateError(locateErrorMessage(err));
+      return;
+    } finally {
+      setLocating(false);
+    }
+    const { latitude, longitude, accuracy } = pos.coords;
+    setProfileDraft((p) => ({
+      ...p,
+      lat: latitude,
+      lng: longitude,
+      pinAccuracy: Number.isFinite(accuracy) ? Math.round(accuracy) : null,
+    }));
+    if (!String(profileDraft.area || "").trim()) {
+      const address = await reverseGeocode(latitude, longitude);
+      if (address) setProfileDraft((p) => (String(p.area || "").trim() ? p : { ...p, area: address }));
+      else toast("Store pinned. Type your address too, so shoppers know where to go.");
+    }
   };
 
   const saveProfile = () => {
@@ -885,6 +1113,29 @@ function SellerView({
     exportCsv("sales_7d", [
       ["Date", "Day", "Net sales"],
       ...labels.map((d, i) => [new Date(dayStarts[i]).toLocaleDateString("en-CA"), d, sales[i]]),
+    ]);
+  };
+
+  /* Every sale ever recorded on this phone, one row per product sold,
+     oldest first: for bookkeeping, or for keeping a copy in Google Sheets. */
+  const exportAllSales = () => {
+    const rows = [...transactions].reverse().flatMap((t) => {
+      const d = t.time instanceof Date ? t.time : new Date(t.time);
+      const ok = !Number.isNaN(d.getTime());
+      const date = ok ? d.toLocaleDateString("en-CA") : "";
+      const time = ok ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+      return t.lines.map((l) => {
+        const returned = l.returnedQty || 0;
+        return [date, time, t.id, l.name, l.qty, l.price, l.qty * l.price, returned, (l.qty - returned) * l.price];
+      });
+    });
+    if (!rows.length) {
+      toast("No sales recorded yet.");
+      return;
+    }
+    exportCsv("sales_all", [
+      ["Date", "Time", "Sale ID", "Product", "Qty", "Price each", "Line total", "Qty returned", "Net"],
+      ...rows,
     ]);
   };
 
@@ -1041,7 +1292,7 @@ function SellerView({
     }
     // "—" is how the app stores "no brand"; shoppers see no brand at all.
     const brand = String(detailEdit.brand || "").trim() || "—";
-    patch(detailEdit.id, (x) => ({ ...x, name, brand, price }));
+    patch(detailEdit.id, (x) => ({ ...x, name, brand, price: Math.round(price * 100) / 100 }));
     setDetailEdit(null);
     toast(`${name} updated.`);
   };
@@ -1058,19 +1309,57 @@ function SellerView({
     toast(`${l.name} deleted.`);
   };
 
+  /* A new store-wide low-stock number also re-labels the products that use
+     it (no number of their own), so "Low" in Inventory, the dashboard and
+     the Shop all match it right away instead of waiting for each product's
+     next sale or restock. A label the owner set by hand (one that doesn't
+     match the old number either) is left as it is. */
+  const changeLowStockDefault = (raw) => {
+    const next = Math.max(0, Number(String(raw).replace(/[^0-9]/g, "")) || 0);
+    const before = settings.lowStockThreshold;
+    setSettings((s) => ({ ...s, lowStockThreshold: next }));
+    setListings((prev) => {
+      let changed = false;
+      const out = prev.map((l) => {
+        if (l.storeId !== MY_STORE || l.lowAt != null) return l;
+        if (l.status !== statusFromQty(l.qty || 0, before)) return l;
+        const status = statusFromQty(l.qty || 0, next);
+        if (status === l.status) return l;
+        changed = true;
+        return { ...l, status };
+      });
+      return changed ? out : prev;
+    });
+  };
+
   const setLowAt = (id, raw) => {
     const v = raw === "" ? undefined : Math.max(0, Number(raw.replace(/[^0-9]/g, "")) || 0);
     patch(id, (l) => ({ ...l, lowAt: v, status: statusFromQty(l.qty || 0, v ?? settings.lowStockThreshold) }));
   };
 
   const addItem = () => {
-    if (!draft.name.trim()) return;
-    const qty = Number(draft.qty) || 0;
-    const price = Number(draft.price) || 0;
+    const name = draft.name.trim();
+    if (!name) {
+      toast("Type the product's name first.");
+      return;
+    }
+    /* The same name and brand twice would show up as two separate products
+       in POS and in the Shop, each with its own stock. Open the existing one
+       instead, where it can be restocked or edited. */
+    const sameText = (a, b) => fold(a).replace(/\s+/g, " ").trim() === fold(b).replace(/\s+/g, " ").trim();
+    const brandOf = (l) => (l.brand && l.brand !== "—" ? l.brand : "");
+    const existing = items.find((l) => sameText(l.name, name) && sameText(brandOf(l), draft.brand));
+    if (existing) {
+      toast(`${existing.name} is already in your inventory. Opened it so you can restock or edit it.`);
+      setOpenProductId(existing.id);
+      return;
+    }
+    const qty = Math.max(0, Math.floor(Number(draft.qty) || 0));
+    const price = Math.max(0, Math.round((Number(draft.price) || 0) * 100) / 100);
     const costEntered = draft.cost.trim() !== "";
-    const cost = costEntered ? Math.max(0, Number(draft.cost) || 0) : Math.round(price * 0.7);
+    const cost = costEntered ? Math.max(0, Math.round((Number(draft.cost) || 0) * 100) / 100) : Math.round(price * 0.7);
     setListings((prev) => [
-      { id: "n" + Date.now(), storeId: MY_STORE, name: draft.name.trim(), brand: draft.brand.trim() || "—", specs: [], price, cost, costEstimated: !costEntered, qty, status: statusFromQty(qty, settings.lowStockThreshold), lastCheckedAt: Date.now() },
+      { id: "n" + Date.now(), storeId: MY_STORE, name, brand: draft.brand.trim() || "—", specs: [], price, cost, costEstimated: !costEntered, qty, status: statusFromQty(qty, settings.lowStockThreshold), lastCheckedAt: Date.now() },
       ...prev,
     ]);
     setDraft({ name: "", brand: "", price: "", qty: "", cost: "" });
@@ -1083,16 +1372,17 @@ function SellerView({
      often filled in later once an invoice is in hand. Clears the estimated
      flag once a real number is entered. */
   const setCost = (id, raw) => {
-    const v = Math.max(0, Number(raw.replace(/[^0-9]/g, "")) || 0);
+    // Centavos count: "12.50" is ₱12.50 (the old version dropped the point and saved ₱1250).
+    const v = Math.max(0, Math.round((Number(raw) || 0) * 100) / 100);
     patch(id, (l) => ({ ...l, cost: v, costEstimated: false }));
   };
 
   /* ---------------------------- POS ---------------------------- */
 
   const posMatches = useMemo(() => {
-    const t = posName.trim().toLowerCase();
+    const t = fold(posName).trim();
     if (!t || posPickId) return [];
-    return items.filter((l) => l.name.toLowerCase().includes(t)).slice(0, 6);
+    return items.filter((l) => fold(l.name).includes(t)).slice(0, 6);
   }, [posName, posPickId, items]);
 
   const inCartQty = (id) => cart.reduce((a, c) => (c.id === id ? a + c.qty : a), 0);
@@ -1373,15 +1663,16 @@ function SellerView({
             {transactions.length === 0 ? (
               <p className="panel-foot">Completed sales will show up here.</p>
             ) : (
+              <>
               <ul className="pos-history">
-                {transactions.map((t) => {
+                {transactions.slice(0, salesShown).map((t) => {
                   const returnedAmt = t.lines.reduce((a, l) => a + l.returnedQty * l.price, 0);
                   const fullyReturned = returnedAmt >= t.total;
                   return (
                     <li key={t.id} className={`pos-tx ${fullyReturned ? "pos-tx-returned" : ""}`}>
                       <div className="pos-tx-top">
                         <span className="pos-tx-time">
-                          {t.time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                          {saleWhen(t.time)}
                           {t.source === "inventory" && <span className="pos-tx-src"> · from Inventory</span>}
                         </span>
                         <span className="pos-tx-total">
@@ -1435,6 +1726,12 @@ function SellerView({
                   );
                 })}
               </ul>
+              {transactions.length > salesShown && (
+                <button className="link pos-more" onClick={() => setSalesShown((n) => n + 20)}>
+                  Show older sales ({transactions.length - salesShown} more)
+                </button>
+              )}
+              </>
             )}
           </section>
         </>
@@ -1476,7 +1773,7 @@ function SellerView({
                             className="field"
                             inputMode="decimal"
                             value={detailEdit.price}
-                            onChange={(e) => setDetailEdit({ ...detailEdit, price: e.target.value.replace(/[^0-9.]/g, "") })}
+                            onChange={(e) => setDetailEdit({ ...detailEdit, price: decimalText(e.target.value) })}
                           />
                         </label>
                         <div className="addrow">
@@ -1594,12 +1891,10 @@ function SellerView({
 
                     <div className={`inv-lowat ${l.costEstimated ? "inv-lowat-warn" : ""}`}>
                       <span className="inv-k">Cost</span>
-                      <input
-                        type="text"
-                        inputMode="numeric"
-                        className="lowat-input"
+                      <DecimalInput
+                        className="lowat-input cost-input"
                         value={l.cost}
-                        onChange={(e) => setCost(l.id, e.target.value)}
+                        onValue={(t) => setCost(l.id, t)}
                         aria-label={`Supplier cost for ${l.name}`}
                       />
                       <span className="lowat-unit">{l.costEstimated ? "estimated — tap to fix" : "per unit"}</span>
@@ -1651,10 +1946,10 @@ function SellerView({
                       <input className="field" placeholder="Product name" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
                       <input className="field" placeholder="Brand (optional)" value={draft.brand} onChange={(e) => setDraft({ ...draft, brand: e.target.value })} />
                       <div className="addrow">
-                        <input className="field" placeholder="Price" inputMode="numeric" value={draft.price} onChange={(e) => setDraft({ ...draft, price: e.target.value })} />
-                        <input className="field" placeholder="On hand" inputMode="numeric" value={draft.qty} onChange={(e) => setDraft({ ...draft, qty: e.target.value })} />
+                        <input className="field" placeholder="Price" inputMode="decimal" value={draft.price} onChange={(e) => setDraft({ ...draft, price: decimalText(e.target.value) })} />
+                        <input className="field" placeholder="On hand" inputMode="numeric" value={draft.qty} onChange={(e) => setDraft({ ...draft, qty: e.target.value.replace(/[^0-9]/g, "") })} />
                       </div>
-                      <input className="field" placeholder="Cost from supplier (optional)" inputMode="numeric" value={draft.cost} onChange={(e) => setDraft({ ...draft, cost: e.target.value })} />
+                      <input className="field" placeholder="Cost from supplier (optional)" inputMode="decimal" value={draft.cost} onChange={(e) => setDraft({ ...draft, cost: decimalText(e.target.value) })} />
                       <p className="addbox-hint">Skip this and margin for this product will just be a rough guess — you can add the real cost later in Inventory.</p>
                       <button className="btn btn-primary" onClick={addItem}>Add product</button>
                     </div>
@@ -1732,10 +2027,11 @@ function SellerView({
                     value={profileDraft.area}
                     onChange={(e) => setProfileDraft({ ...profileDraft, area: e.target.value })}
                   />
-                  <button type="button" className="btn btn-ghost btn-sm field-row-btn" onClick={useMyLocation} disabled={locating}>
+                  <button type="button" className="btn btn-ghost btn-sm field-row-btn" onClick={pinStoreLocation} disabled={locating}>
                     {locating ? "Locating…" : "Use my location"}
                   </button>
                 </div>
+                {locating && <p className="pin-note">Finding your location. This can take up to a minute; it's quicker outdoors or near a window.</p>}
                 {locateError && <p className="pin-error">{locateError}</p>}
                 {profileTouched && profileErrors.area && <p className="pin-error">{profileErrors.area}</p>}
                 <p className="pin-note">
@@ -1848,7 +2144,7 @@ function SellerView({
                 style={{ maxWidth: 90 }}
                 inputMode="numeric"
                 value={settings.lowStockThreshold}
-                onChange={(e) => setSettings((s) => ({ ...s, lowStockThreshold: Math.max(0, Number(e.target.value.replace(/[^0-9]/g, "")) || 0) }))}
+                onChange={(e) => changeLowStockDefault(e.target.value)}
               />
               <span className="settings-row-note">units or fewer</span>
             </div>
@@ -1913,6 +2209,7 @@ function SellerView({
 
           <section className="panel">
             <button className="link" onClick={onSignOut}>Sign out</button>
+            <p className="build-note">Andito · {BUILD_LABEL}</p>
           </section>
         </>
       )}
@@ -1962,6 +2259,7 @@ function SellerView({
             <div className="settings-row">
               <button className="btn btn-primary btn-sm" onClick={exportInventory} disabled={exporting}>Export inventory</button>
               <button className="btn btn-ghost btn-sm" onClick={exportSales} disabled={exporting}>Export sales (7d)</button>
+              <button className="btn btn-ghost btn-sm" onClick={exportAllSales} disabled={exporting}>Export all sales</button>
             </div>
           </section>
 
@@ -2119,39 +2417,72 @@ export default function Andito() {
      real, now-persisted data — see startFreshOwnerAccount below). */
   const [ownerConfigured, setOwnerConfigured] = useState(false);
 
-  /* Everything above is in-memory only by default — a reload wipes it. This
-     restores a previous session from this artifact's personal key-value
-     storage (not shared: only this browser/account sees it back). Only
-     MY_STORE's listings are saved/restored; s2–s5 are static demo data that
-     never changes, so there's nothing to persist for them. */
+  /* Restores the last session saved on this phone (see storagePolyfill.js).
+     Three outcomes, kept apart on purpose:
+       - nothing saved: a first launch, start fresh;
+       - saved, but this phone can't read it right now: show an error and
+         DON'T start (an empty store would be autosaved over the real one);
+       - saved, but damaged: keep a copy under another name, start fresh,
+         and tell the owner to restore their latest backup. */
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState(null); // message | null
+  const [storageNotice, setStorageNotice] = useState(null); // message | null
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      let res;
       try {
-        const res = await window.storage.get("app-state");
-        const saved = res?.value ? JSON.parse(res.value) : null;
-        if (saved && !cancelled) {
-          if (saved.account) setAccount(saved.account);
-          if (saved.storeProfile) { setStoreProfile(saved.storeProfile); setOwnerConfigured(true); }
-          if (Array.isArray(saved.myListings)) {
-            setListings((prev) => [...prev.filter((l) => l.storeId !== MY_STORE), ...saved.myListings]);
-          }
-          // saved.sales (the old undated 7-slot array) is intentionally ignored:
-          // sales figures are rebuilt from the dated transaction log below.
-          if (Array.isArray(saved.transactions)) {
-            setTransactions(saved.transactions.map((t) => ({ ...t, time: new Date(t.time) })));
-          }
-          if (saved.settings) setSettings((s) => ({ ...s, ...saved.settings }));
-          if (saved.favorites) setFavorites(saved.favorites);
-          if (Array.isArray(saved.cart)) setCart(saved.cart);
-          if (saved.account) setView(saved.account.role === "owner" ? "seller" : "shop");
-        }
-      } catch {
-        // first run on this device — nothing saved yet, start fresh
-      } finally {
-        if (!cancelled) setLoaded(true);
+        res = await window.storage.get("app-state");
+      } catch (e) {
+        if (!cancelled) setLoadError(String(e?.message || e) || "Unknown error");
+        return;
       }
+      let saved = null;
+      if (res?.value) {
+        try {
+          saved = parseSavedState(res.value);
+        } catch {
+          // Start fresh only once the damaged data is safely copied: the
+          // first autosave of the fresh store replaces "app-state".
+          try {
+            await window.storage.set(`app-state-damaged-${Date.now()}`, res.value);
+          } catch (e) {
+            if (!cancelled) setLoadError(`Your saved data is damaged, and a safety copy couldn't be made (${String(e?.message || e)}).`);
+            return;
+          }
+          if (!cancelled) {
+            setStorageNotice(
+              "Your saved store data was damaged and couldn't be opened, so Andito started fresh. A copy was kept. If you have a backup, restore it from Data."
+            );
+          }
+        }
+      }
+      if (cancelled) return;
+      // Only possible if Android cleared Andito's saved data (see storagePolyfill.js).
+      if (res?.lost) {
+        setStorageNotice(
+          "Andito couldn't find your saved store data on this phone, so it started empty. If you have a backup, restore it from Data."
+        );
+      } else if (res?.stale && saved) {
+        setStorageNotice(
+          "Andito couldn't find your latest saved data, so it opened an older copy. If you have a newer backup, restore it from Data."
+        );
+      }
+      if (saved) {
+        if (saved.account) setAccount(saved.account);
+        if (saved.storeProfile) { setStoreProfile(saved.storeProfile); setOwnerConfigured(true); }
+        if (saved.myListings) {
+          setListings((prev) => [...prev.filter((l) => l.storeId !== MY_STORE), ...saved.myListings]);
+        }
+        // Sales figures are rebuilt from this dated log (an old undated
+        // "sales" array, if present, is ignored).
+        if (saved.transactions) setTransactions(saved.transactions);
+        if (saved.settings) setSettings((s) => ({ ...s, ...saved.settings }));
+        if (saved.favorites) setFavorites(saved.favorites);
+        if (saved.cart) setCart(saved.cart);
+        if (saved.account) setView(saved.account.role === "owner" ? "seller" : "shop");
+      }
+      setLoaded(true);
     })();
     return () => { cancelled = true; };
   }, []);
@@ -2216,48 +2547,91 @@ export default function Andito() {
     };
   }, []);
 
-  /* Real distance for shoppers, opt-in. Nothing is requested automatically —
-     browsers (and this sandbox) require a user gesture for a geolocation
-     prompt anyway, and asking on load feels invasive. Until the shopper taps
-     "Use my location," every store falls back to its fixed demo distance
-     (see the stores useMemo below). */
+  /* Real distance for shoppers, opt-in. Nothing is requested automatically:
+     asking for location the moment the app opens feels invasive. Until the
+     shopper taps "Use my location", stores show no distance at all (never
+     a guessed one). Network fix first, then GPS (see locate). */
   const [userLoc, setUserLoc] = useState(null); // {lat,lng} | null
   const [locStatus, setLocStatus] = useState("idle"); // idle | locating | granted | denied | unavailable
 
-  const requestUserLocation = () => {
+  const requestUserLocation = async () => {
     if (!navigator.geolocation) {
       setLocStatus("unavailable");
-      toast("Location isn't available on this device or browser.");
+      toast("This phone can't share its location with Andito.");
       return;
     }
+    const hadLocation = !!userLoc;
     setLocStatus("locating");
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setUserLoc({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-        setLocStatus("granted");
-        toast("Using your location for distances.");
-      },
-      (err) => {
-        setLocStatus(err.code === 1 ? "denied" : "unavailable");
-        toast(err.code === 1 ? "Location permission denied." : "Couldn't get your location.");
-      },
-      { enableHighAccuracy: false, timeout: 10000 }
+    try {
+      const pos = await locate({ precise: false });
+      setUserLoc({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+      setLocStatus("granted");
+      toast(hadLocation ? "Distances updated." : "Using your location for distances.");
+    } catch (err) {
+      // An update that fails keeps the distances from the last good fix.
+      setLocStatus(hadLocation ? "granted" : err && err.code === 1 ? "denied" : "unavailable");
+      toast(locateErrorMessage(err));
+    }
+  };
+
+  /* One message at a time. A new message replaces the old one and gets its
+     own full time on screen (the old timer used to cut it short), and
+     longer messages stay up longer. */
+  const toastTimerRef = useRef(null);
+  const toast = (t) => {
+    setMsg(t);
+    clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setMsg(null), Math.min(7000, 2500 + String(t).length * 35));
+  };
+
+  /* Autosave. Changes made within SAVE_DELAY_MS of each other are saved
+     together (typing a price doesn't rewrite the whole store on every key),
+     and anything waiting is saved at once when Andito goes to the
+     background (see useAppLifecycle below). Waits for `loaded`, so the
+     first render can't save fresh-boot defaults over the last session.
+     A failed save is shown on screen (saveError) and retried. */
+  const SAVE_DELAY_MS = 400;
+  const [saveError, setSaveError] = useState(null); // message | null
+  const latestStateRef = useRef(null);
+  const unsavedRef = useRef(false);
+  const saveTimerRef = useRef(null);
+
+  const flushSave = () => {
+    clearTimeout(saveTimerRef.current);
+    if (!unsavedRef.current || !latestStateRef.current) return;
+    unsavedRef.current = false;
+    const { account, storeProfile, listings, transactions, settings, favorites, cart } = latestStateRef.current;
+    let json;
+    try {
+      json = JSON.stringify({
+        account,
+        storeProfile,
+        myListings: listings.filter((l) => l.storeId === MY_STORE),
+        transactions,
+        settings,
+        favorites,
+        cart,
+      });
+    } catch (e) {
+      unsavedRef.current = true;
+      setSaveError(String(e?.message || e));
+      return;
+    }
+    window.storage.set("app-state", json).then(
+      () => setSaveError(null),
+      (e) => {
+        unsavedRef.current = true; // try again with the next change, or "Try again"
+        setSaveError(String(e?.message || e) || "Unknown error");
+      }
     );
   };
 
-  const toast = (t) => {
-    setMsg(t);
-    setTimeout(() => setMsg(null), 2800);
-  };
-
-  /* Write-through autosave: fires whenever any persisted slice changes.
-     Gated on `loaded` so the very first render (before the restore above
-     has finished) can't stomp a previous session with fresh-boot defaults. */
   useEffect(() => {
     if (!loaded) return;
-    const myListings = listings.filter((l) => l.storeId === MY_STORE);
-    const payload = { account, storeProfile, myListings, transactions, settings, favorites, cart };
-    window.storage.set("app-state", JSON.stringify(payload)).catch(() => {});
+    latestStateRef.current = { account, storeProfile, listings, transactions, settings, favorites, cart };
+    unsavedRef.current = true;
+    clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(flushSave, SAVE_DELAY_MS);
   }, [loaded, account, storeProfile, listings, transactions, settings, favorites, cart]);
 
   /* Publishing the owner's store to Firebase (stage 1 of the backend).
@@ -2327,35 +2701,58 @@ export default function Andito() {
     return [...listings, ...market.listings.filter((l) => !ownIds.has(l.storeId))];
   }, [listings, market.listings, market.ownUid, storeSync.state.uid]);
 
-  /* Notify on restocks for anything the user has favorited — either the
-     product itself, or any item at a favorited store. Only fires on view
-     "shop" so a seller mid-edit on their own dashboard isn't interrupted.
-     toast() only holds one message at a time, so if several favorited
-     items restock in the same update, collapse them into a single summary
-     line instead of firing toast() per item — otherwise every call but the
-     last silently overwrites the one before it and never gets seen. */
-  const prevListingsRef = useRef(listings);
+  /* Restock alerts for what the shopper follows: a favorited product, or any
+     product at a favorited store, going from low or out of stock back to in
+     stock. This watches every store in the Shop, not only this phone's own
+     (which is what it used to watch, so shoppers never got an alert). Other
+     stores' changes arrive when the Shop list refreshes from Firebase.
+     Alerts show only on the Shop screens, so an owner busy in My Store isn't
+     interrupted, and several at once become one summary message. */
+  const followedStatusRef = useRef(null); // Map<listingId, status> | null
   useEffect(() => {
-    const prev = prevListingsRef.current;
-    if (view === "shop" || view === "store") {
-      const notes = [];
-      listings.forEach((l) => {
-        const before = prev.find((p) => p.id === l.id);
-        if (!before || before.status === l.status) return;
-        const restocked = before.status !== "in" && l.status === "in";
-        if (!restocked) return;
-        const store = STORES.find((s) => s.id === l.storeId);
-        if (favorites.products.includes(l.id)) {
-          notes.push(`${l.name} is back in stock at ${store?.name || "a store you follow"}.`);
-        } else if (favorites.stores.includes(l.storeId)) {
-          notes.push(`${store?.name} restocked ${l.name}.`);
-        }
-      });
-      if (notes.length === 1) toast(notes[0]);
-      else if (notes.length > 1) toast(`${notes.length} items you follow are back in stock.`);
+    const favProducts = new Set(favorites.products);
+    const favStores = new Set(favorites.stores);
+    const followed = shopListings.filter((l) => favProducts.has(l.id) || favStores.has(l.storeId));
+    const before = followedStatusRef.current;
+    followedStatusRef.current = new Map(followed.map((l) => [l.id, l.status]));
+    if (!before || !(view === "shop" || view === "store")) return;
+    const notes = [];
+    followed.forEach((l) => {
+      const was = before.get(l.id);
+      if (!was || was === "in" || l.status !== "in") return;
+      const storeName = stores.find((s) => s.id === l.storeId)?.name || "a store you follow";
+      notes.push(favProducts.has(l.id) ? `${l.name} is back in stock at ${storeName}.` : `${storeName} restocked ${l.name}.`);
+    });
+    if (notes.length === 1) toast(notes[0]);
+    else if (notes.length > 1) toast(`${notes.length} items you follow are back in stock.`);
+  }, [shopListings, favorites]);
+
+  /* Keep the Shop list current: reload it when the Shop screen opens and
+     when Andito comes back from the background. refresh() skips the
+     download if the list is less than 5 minutes old, so this stays well
+     inside Firebase's free daily reads. */
+  useEffect(() => {
+    if (view === "shop") market.refresh();
+  }, [view]);
+
+  /* Going to the background: save anything waiting, right away.
+     Coming back: re-lock My Store if the PIN is on and Andito was away for
+     a while (so the PIN protects a shared phone, not just the first open),
+     and refresh the Shop list. */
+  const PIN_RELOCK_MS = 5 * 60 * 1000;
+  const hiddenAtRef = useRef(null);
+  useAppLifecycle(
+    () => {
+      flushSave();
+      if (hiddenAtRef.current == null) hiddenAtRef.current = Date.now();
+    },
+    () => {
+      const away = hiddenAtRef.current == null ? 0 : Date.now() - hiddenAtRef.current;
+      hiddenAtRef.current = null;
+      if (away > PIN_RELOCK_MS) setPinUnlocked(false);
+      if (view === "shop" || view === "store") market.refresh();
     }
-    prevListingsRef.current = listings;
-  }, [listings]);
+  );
 
   const resetDemoData = () => {
     setListings(LISTINGS);
@@ -2364,12 +2761,8 @@ export default function Andito() {
     toast("Store data cleared.");
   };
 
-  /* A fresh "I have a store" signup already starts with a blank profile
-     (see onContinue below) — but MY_STORE's listings, sales, and past
-     transactions are shared demo data, so without this a brand-new owner's
-     first login shows someone else's laptop chargers and GPUs as if they
-     already had stock. Strip everything tied to MY_STORE so "blank profile"
-     actually means "blank store." */
+  /* A first-time "I have a store" signup starts from a blank store: no
+     products, no sales, an empty cart (see onContinue below). */
   const startFreshOwnerAccount = () => {
     setListings((prev) => prev.filter((l) => l.storeId !== MY_STORE));
     setTransactions([]);
@@ -2395,7 +2788,7 @@ export default function Andito() {
       lastCheckedAt: typeof l.lastCheckedAt === "number" ? l.lastCheckedAt : Date.now(),
     }));
     setListings((prev) => [...prev.filter((l) => l.storeId !== MY_STORE), ...restored]);
-    setTransactions(data.transactions.map((t) => ({ ...t, time: new Date(t.time) })));
+    setTransactions(cleanTransactions(data.transactions));
     if (data.storeProfile) setStoreProfile((p) => ({ ...p, ...data.storeProfile }));
     if (data.settings) {
       setSettings((s) => ({
@@ -2939,9 +3332,47 @@ export default function Andito() {
 .landing-card:active{transform:scale(.98);}
 .brandmark{transition:opacity .15s ease;}
 .brandmark:active{opacity:.6;}
+
+/* links styled as buttons (Call / Text / Directions) */
+a.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;}
+.loc-update{font-size:12.5px;margin-left:6px;}
+.cost-input{width:80px;}
+.pos-more{display:block;margin-top:12px;}
+.build-note{margin:12px 0 0;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--ink-30);}
+.account-menu-build{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink-30);margin:8px 10px 2px;}
+
+/* saving problems: always visible until fixed or dismissed */
+.save-alert{background:#F5E4E1;color:#7A2C22;border-bottom:1px solid #E8C9C3;padding:10px 18px;
+  font-size:13px;line-height:1.45;}
+.save-alert .link{color:#7A2C22;margin-left:8px;font-size:13px;}
+.load-fail{min-height:80vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  text-align:center;gap:12px;padding:24px;max-width:460px;margin:0 auto;}
+.load-fail p{margin:0;color:var(--ink-60);font-size:14.5px;line-height:1.55;}
       `}</style>
 
-      {view === "landing" ? (
+      {saveError && (
+        <div className="save-alert" role="alert">
+          Couldn't save your latest changes ({saveError}). Keep Andito open, and back up your store from Data.
+          <button className="link" onClick={flushSave}>Try again</button>
+        </div>
+      )}
+      {!saveError && storageNotice && (
+        <div className="save-alert" role="alert">
+          {storageNotice}
+          <button className="link" onClick={() => setStorageNotice(null)}>OK</button>
+        </div>
+      )}
+
+      {!loaded ? (
+        loadError ? (
+          <div className="load-fail">
+            <h1 className="store-name">Couldn't open your saved data</h1>
+            <p>Nothing was changed or deleted. Close Andito completely (swipe it away from your recent apps), then open it again. If your phone's storage is full, free up some space first.</p>
+            <p className="panel-note">{loadError}</p>
+            <button className="btn btn-primary" onClick={() => window.location.reload()}>Try again</button>
+          </div>
+        ) : null
+      ) : view === "landing" ? (
         <div key="landing" className="page-fade">
           <LandingView onGetStarted={() => setView("shop")} />
         </div>
@@ -2956,7 +3387,7 @@ export default function Andito() {
                      blank (not the demo "ABC Computer Store" data) so the
                      owner sets up their own store. Phone carries over since
                      they already typed it during signup. */
-                  setStoreProfile({ name: "", kind: "", area: "", hours: "", phone });
+                  setStoreProfile({ name: "", kind: "", area: "", hours: "", phone, lat: null, lng: null, pinAccuracy: null });
                   startFreshOwnerAccount();
                 } else {
                   /* Returning owner who signed out and is signing back in —
@@ -3023,6 +3454,7 @@ export default function Andito() {
                     <div className="nav-backdrop" onClick={() => setAccountMenuOpen(false)} />
                     <div className="account-menu">
                       <p className="account-menu-phone">{account.phone}</p>
+                      <p className="account-menu-build">{BUILD_LABEL}</p>
                       <button
                         className="account-menu-item"
                         onClick={() => {
