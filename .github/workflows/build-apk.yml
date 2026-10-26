@@ -97,6 +97,7 @@ jobs:
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
           ACTUAL=$("${BUILD_TOOLS}apksigner" verify --print-certs android/app/build/outputs/apk/debug/app-debug.apk \
             | grep -m1 'certificate SHA-256 digest' | awk '{print $NF}')
+          keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey | grep -E "SHA1:|SHA256:"
           echo "Permanent key: $EXPECTED"
           echo "APK signed by: $ACTUAL"
           if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
